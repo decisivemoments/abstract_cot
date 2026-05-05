@@ -32,7 +32,7 @@ fi
 conda activate "${CONDA_ENV_NAME}"
 python -m pip install --upgrade pip
 python -m pip install --upgrade uv
-uv pip install -e "${PROJECT_ROOT}[train,dev]" huggingface_hub
+uv pip install -r "${PROJECT_ROOT}/requirements-dev.txt"
 
 cat <<EOF
 Server bootstrap complete.

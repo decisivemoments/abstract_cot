@@ -10,10 +10,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
-[project.optional-dependencies]
-train = ["pyyaml>=6.0", "datasets>=2.19", "torch>=2.2", "transformers>=4.40"]
-dev = ["pytest>=8.0"]
-
 [tool.setuptools]
 package-dir = {"" = "src"}
 

@@ -21,5 +21,9 @@ warmup:
   max_samples: 16
   learning_rate: 1.0e-5
 
+distributed:
+  use_fsdp: false
+  nproc_per_node: 8
+
 output:
   root_dir: outputs/experiments

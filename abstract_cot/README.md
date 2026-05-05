@@ -86,6 +86,13 @@ The runtime defaults are defined in:
 
 - [cisl113.yaml](/Users/zhangjunyi/project/abstrcot/abstract_cot/configs/runtime/cisl113.yaml:1)
 
+Dependency management now uses:
+
+- [requirements.txt](/Users/zhangjunyi/project/abstrcot/abstract_cot/requirements.txt:1)
+- [requirements-dev.txt](/Users/zhangjunyi/project/abstrcot/abstract_cot/requirements-dev.txt:1)
+
+The remaining [pyproject.toml](/Users/zhangjunyi/project/abstrcot/abstract_cot/pyproject.toml:1) is kept only as minimal packaging metadata for the `src/` layout. It is no longer the primary dependency manifest.
+
 ### Model And Dataset Downloads
 
 Only download assets on `cisl113`.
@@ -118,6 +125,13 @@ After sync, bootstrap, and downloads complete on `cisl113`, the first smoke run 
 ```bash
 cd ~/workspace/abstract_cot
 bash scripts/run_server_warmup.sh
+```
+
+Single-node 8 GPU FSDP smoke run:
+
+```bash
+cd ~/workspace/abstract_cot
+USE_FSDP=true NPROC_PER_NODE=8 bash scripts/run_server_warmup.sh
 ```
 
 The current MVP script:
@@ -166,3 +180,4 @@ This branch is experimental and not yet wired into the main warm-up runner.
 
 - The remote environment was not auto-probed from this session, so `~/workspace/abstract_cot` is an explicit convention, not a verified existing directory.
 - `server_assets/` should be kept out of Mutagen-managed sync, even if it remains inside the project directory on the server.
+- `build/lib/abstract_cot` and `src/*.egg-info` are Python packaging build artifacts. They appear when setuptools-based installation/build steps run. They are not source directories and should remain ignored.

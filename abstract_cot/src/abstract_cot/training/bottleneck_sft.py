@@ -13,6 +13,7 @@ from abstract_cot.data.tokenized_features import (
     resolve_pad_token_id,
 )
 from abstract_cot.data.warmup_dataset import build_bottleneck_sft_example, initialize_random_trace
+from abstract_cot.training.distributed import DistributedContext, reduce_scalar_sum, shard_sequence_for_rank
 from abstract_cot.training.sft_trainer import BottleneckSFTTrainer, DistillationSFTTrainer
 from abstract_cot.utils.io import write_json
 
@@ -28,6 +29,8 @@ class WarmupRuntimeConfig:
     learning_rate: float
     epochs: int
     seed: int
+    device: str = "cpu"
+    use_fsdp: bool = False
 
 
 def _parse_messages_row(row: dict, idx: int) -> SupervisedSample | None:
@@ -141,9 +144,24 @@ def _loss_scalar(loss) -> float:
     return float(loss.detach().cpu().item()) if hasattr(loss, "detach") else float(loss)
 
 
-def run_minimal_sft_epoch(trainer, optimizer, batches):
+def run_minimal_sft_epoch(
+    trainer,
+    optimizer,
+    batches,
+    *,
+    distributed: DistributedContext,
+    phase_name: str,
+):
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:  # pragma: no cover - optional dependency
+        tqdm = None
+
     losses: list[float] = []
-    for batch in batches:
+    iterable = batches
+    if tqdm is not None and distributed.is_main_process:
+        iterable = tqdm(batches, desc=phase_name, leave=False)
+    for batch in iterable:
         optimizer.zero_grad()
         result = trainer.training_step(batch)
         loss = result.loss
@@ -151,11 +169,30 @@ def run_minimal_sft_epoch(trainer, optimizer, batches):
             loss.backward()
             optimizer.step()
         losses.append(_loss_scalar(loss))
+        if tqdm is not None and distributed.is_main_process and hasattr(iterable, "set_postfix"):
+            iterable.set_postfix(loss=f"{losses[-1]:.4f}")
+
+    local_steps = len(losses)
+    local_loss_sum = sum(losses)
+    total_steps = int(reduce_scalar_sum(float(local_steps), distributed.device))
+    total_loss_sum = reduce_scalar_sum(local_loss_sum, distributed.device)
     return {
-        "num_steps": len(losses),
-        "mean_loss": sum(losses) / max(len(losses), 1),
+        "num_steps": total_steps,
+        "mean_loss": total_loss_sum / max(total_steps, 1),
         "last_loss": losses[-1] if losses else None,
     }
+
+
+def maybe_wrap_fsdp(model, *, distributed: DistributedContext, use_fsdp: bool):
+    if not use_fsdp:
+        return model
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("FSDP is not available in this torch build") from exc
+    if not distributed.enabled:
+        raise RuntimeError("FSDP requested but distributed process group is not initialized")
+    return FSDP(model, device_id=distributed.local_rank if distributed.device.startswith("cuda") else None)
 
 
 def run_minimal_warmup(
@@ -164,6 +201,7 @@ def run_minimal_warmup(
     tokenizer,
     abstract_tokens: list[str],
     runtime: WarmupRuntimeConfig,
+    distributed: DistributedContext,
 ):
     try:
         import torch
@@ -178,20 +216,43 @@ def run_minimal_warmup(
         samples, tokenizer, abstract_tokens, runtime.batch_size, runtime.seed + 1
     )
 
+    bottleneck_batches = shard_sequence_for_rank(bottleneck_batches, distributed.rank, distributed.world_size)
+    distill_batches = shard_sequence_for_rank(distill_batches, distributed.rank, distributed.world_size)
+
+    model = maybe_wrap_fsdp(model, distributed=distributed, use_fsdp=runtime.use_fsdp)
     optimizer = torch.optim.AdamW(model.parameters(), lr=runtime.learning_rate)
-    bottleneck_trainer = BottleneckSFTTrainer(model, as_tensors=True)
-    distill_trainer = DistillationSFTTrainer(model, as_tensors=True)
+    bottleneck_trainer = BottleneckSFTTrainer(model, as_tensors=True, device=runtime.device)
+    distill_trainer = DistillationSFTTrainer(model, as_tensors=True, device=runtime.device)
 
     summary = {
         "num_samples": len(samples),
         "bottleneck_batches": len(bottleneck_batches),
         "distill_batches": len(distill_batches),
+        "device": runtime.device,
+        "distributed": {
+            "enabled": distributed.enabled,
+            "rank": distributed.rank,
+            "world_size": distributed.world_size,
+            "use_fsdp": runtime.use_fsdp,
+        },
         "epochs": [],
     }
     for epoch in range(1, runtime.epochs + 1):
         model.train()
-        bottleneck_metrics = run_minimal_sft_epoch(bottleneck_trainer, optimizer, bottleneck_batches)
-        distill_metrics = run_minimal_sft_epoch(distill_trainer, optimizer, distill_batches)
+        bottleneck_metrics = run_minimal_sft_epoch(
+            bottleneck_trainer,
+            optimizer,
+            bottleneck_batches,
+            distributed=distributed,
+            phase_name=f"epoch{epoch}-bottleneck",
+        )
+        distill_metrics = run_minimal_sft_epoch(
+            distill_trainer,
+            optimizer,
+            distill_batches,
+            distributed=distributed,
+            phase_name=f"epoch{epoch}-distill",
+        )
         summary["epochs"].append(
             {
                 "epoch": epoch,
@@ -200,9 +261,11 @@ def run_minimal_warmup(
             }
         )
 
-    write_json(f"{runtime.output_dir}/warmup_summary.json", summary)
-    if hasattr(tokenizer, "save_pretrained"):
-        tokenizer.save_pretrained(runtime.output_dir)
-    if hasattr(model, "save_pretrained"):
-        model.save_pretrained(runtime.output_dir)
+    if distributed.is_main_process:
+        write_json(f"{runtime.output_dir}/warmup_summary.json", summary)
+        if hasattr(tokenizer, "save_pretrained"):
+            tokenizer.save_pretrained(runtime.output_dir)
+        stateful_model = getattr(model, "module", model)
+        if hasattr(stateful_model, "save_pretrained"):
+            stateful_model.save_pretrained(runtime.output_dir)
     return summary

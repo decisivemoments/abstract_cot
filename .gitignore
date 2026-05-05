@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+build/
+.eggs/
+.coverage
+.coverage.*
 .venv/
 abstract_cot/outputs/
 abstract_cot/.mutagen/
@@ -8,5 +12,7 @@ abstract_cot/data/
 abstract_cot/models/
 abstract_cot/datasets/
 abstract_cot/server_assets/
+abstract_cot/build/
+abstract_cot/src/*.egg-info/
 mutagen.yml
 mutagen.yml.lock

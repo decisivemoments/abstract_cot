@@ -1,0 +1,7 @@
+model:
+  family: qwen3
+  size: 0.6b
+  repo_id: Qwen/Qwen3-0.6B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa

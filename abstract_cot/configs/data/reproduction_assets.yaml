@@ -1,0 +1,23 @@
+datasets:
+  warmup_train:
+    repo_type: dataset
+    repo_id: allenai/Dolci-Think-SFT-7B
+    local_subdir: datasets/Dolci-Think-SFT-7B
+  rl_train:
+    repo_type: dataset
+    repo_id: allenai/Dolci-Think-RL-7B
+    local_subdir: datasets/Dolci-Think-RL-7B
+
+models:
+  qwen3_0p6b:
+    repo_type: model
+    repo_id: Qwen/Qwen3-0.6B
+    local_subdir: models/Qwen3-0.6B
+  qwen3_1p7b:
+    repo_type: model
+    repo_id: Qwen/Qwen3-1.7B
+    local_subdir: models/Qwen3-1.7B
+  qwen3_4b:
+    repo_type: model
+    repo_id: Qwen/Qwen3-4B
+    local_subdir: models/Qwen3-4B

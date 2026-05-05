@@ -1,0 +1,25 @@
+experiment_id: mvp_warmup
+seed: 42
+
+model:
+  base_model: server_assets/models/Qwen3-0.6B
+  tokenizer_path: server_assets/models/Qwen3-0.6B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+
+abstract:
+  vocab_size: 64
+  naming_scheme: excel
+  max_trace_length: 128
+
+warmup:
+  rounds: 1
+  bottleneck_epochs: 1
+  distill_epochs: 1
+  dataset_path: server_assets/datasets/Dolci-Think-SFT-7B
+  batch_size: 2
+  max_samples: 16
+  learning_rate: 1.0e-5
+
+output:
+  root_dir: outputs/experiments

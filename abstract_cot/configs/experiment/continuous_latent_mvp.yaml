@@ -1,0 +1,26 @@
+experiment_id: continuous_latent_mvp
+seed: 42
+
+model:
+  base_model: server_assets/models/Qwen3-0.6B
+  tokenizer_path: server_assets/models/Qwen3-0.6B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+
+continuous:
+  enabled: true
+  end_token: <endabstract>
+  max_reasoning_steps: 32
+  do_sample: false
+  temperature: 1.0
+  detach_between_steps: false
+
+warmup:
+  dataset_path: server_assets/datasets/Dolci-Think-SFT-7B
+  max_samples: 8
+
+rl:
+  max_answer_tokens: 128
+
+output:
+  root_dir: outputs/experiments

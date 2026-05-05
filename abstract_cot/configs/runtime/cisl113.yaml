@@ -1,0 +1,10 @@
+server:
+  ssh_alias: cisl113
+  remote_root: ~/workspace/abstract_cot
+  cache_root: ~/workspace/.cache/abstract_cot
+  conda_env_name: abstract-cot
+  python_version: "3.11"
+
+downloads:
+  provider: hf-mirror
+  hf_endpoint: https://hf-mirror.com

@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from abstract_cot.modeling.embedding_resize import resize_model_embeddings
+from abstract_cot.modeling.model_loader import load_causal_lm, load_tokenizer, resolve_torch_dtype
+from abstract_cot.tokenization.abstract_vocab import AbstractTokenSpec, build_abstract_vocabulary
+from abstract_cot.tokenization.tokenizer_extension import extend_tokenizer
+from abstract_cot.training.bottleneck_sft import WarmupRuntimeConfig, run_minimal_warmup
+from abstract_cot.utils.config import load_config
+from abstract_cot.utils.seed import set_seed
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run a minimal Abstract-CoT warm-up SFT smoke run.")
+    parser.add_argument("--config", required=True, help="Experiment YAML config")
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Optional explicit output directory. Defaults to outputs/experiments/<experiment_id>",
+    )
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    experiment_id = config["experiment_id"]
+    output_dir = Path(args.output_dir or Path(config["output"]["root_dir"]) / experiment_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    set_seed(int(config["seed"]))
+
+    model_cfg = config["model"]
+    tokenizer = load_tokenizer(
+        model_cfg["tokenizer_path"],
+        trust_remote_code=bool(model_cfg.get("trust_remote_code", False)),
+    )
+    model = load_causal_lm(
+        model_cfg["base_model"],
+        trust_remote_code=bool(model_cfg.get("trust_remote_code", False)),
+        dtype=resolve_torch_dtype(model_cfg.get("torch_dtype")),
+    )
+
+    abstract_cfg = config["abstract"]
+    token_spec = AbstractTokenSpec(
+        abstract_tokens=build_abstract_vocabulary(
+            int(abstract_cfg["vocab_size"]),
+            str(abstract_cfg.get("naming_scheme", "excel")),
+        )
+    )
+    tokenizer_dir = output_dir / "tokenizer"
+    artifacts = extend_tokenizer(tokenizer, token_spec, tokenizer_dir)
+    resize_model_embeddings(model, len(tokenizer))
+
+    warmup_cfg = config["warmup"]
+    summary = run_minimal_warmup(
+        model=model,
+        tokenizer=tokenizer,
+        abstract_tokens=artifacts.abstract_tokens,
+        runtime=WarmupRuntimeConfig(
+            dataset_path=str(warmup_cfg["dataset_path"]),
+            output_dir=str(output_dir),
+            batch_size=int(warmup_cfg["batch_size"]),
+            max_samples=int(warmup_cfg["max_samples"]),
+            learning_rate=float(warmup_cfg["learning_rate"]),
+            epochs=int(warmup_cfg["bottleneck_epochs"]) + int(warmup_cfg["distill_epochs"]),
+            seed=int(config["seed"]),
+        ),
+    )
+    print(summary)
+
+
+if __name__ == "__main__":
+    main()

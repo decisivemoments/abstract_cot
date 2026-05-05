@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+abstract_cot/outputs/
+abstract_cot/.mutagen/
+abstract_cot/data/
+abstract_cot/models/
+abstract_cot/datasets/
+abstract_cot/server_assets/
+mutagen.yml
+mutagen.yml.lock

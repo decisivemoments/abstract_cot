@@ -25,9 +25,9 @@ RL and full training loops are intentionally staged on top of these primitives.
 This project is designed for:
 
 - local git management on your laptop
-- one-way code sync to `cisl113` via `mutagen`
+- one-way code sync to the server via `mutagen`
 - server environment managed by `conda`, with dependencies installed by `uv pip`
-- model and dataset downloads only on `cisl113`
+- model and dataset downloads only on the server
 
 ### Mutagen
 
@@ -68,7 +68,7 @@ The sync definition now lives in:
 
 ### Server Bootstrap
 
-After the first sync, SSH into `cisl113` and run:
+After the first sync, SSH into the server and run:
 
 ```bash
 cd ~/workspace/abstract_cot
@@ -84,7 +84,7 @@ This creates:
 
 The runtime defaults are defined in:
 
-- [cisl113.yaml](/Users/zhangjunyi/project/abstrcot/abstract_cot/configs/runtime/cisl113.yaml:1)
+- [server.yaml](/Users/zhangjunyi/project/abstrcot/abstract_cot/configs/runtime/server.yaml:1)
 
 Dependency management now uses:
 
@@ -95,7 +95,7 @@ The remaining [pyproject.toml](/Users/zhangjunyi/project/abstrcot/abstract_cot/p
 
 ### Model And Dataset Downloads
 
-Only download assets on `cisl113`.
+Only download assets on the server.
 
 Baseline download:
 
@@ -120,7 +120,7 @@ Additional model configs are available in:
 
 ### First Warm-Up Run
 
-After sync, bootstrap, and downloads complete on `cisl113`, the first smoke run is:
+After sync, bootstrap, and downloads complete on the server, the first smoke run is:
 
 ```bash
 cd ~/workspace/abstract_cot
@@ -140,6 +140,7 @@ The current MVP script:
 - extends the tokenizer with abstract tokens
 - resizes embeddings
 - loads the local Hugging Face parquet dataset via `datasets.load_dataset(...)`
+- uses the machine's full available CPU count for dataset loading
 - runs a minimal bottleneck/distillation SFT pass
 
 Expected dataset path in the current config:

@@ -1,5 +1,5 @@
 server:
-  ssh_alias: cisl113
+  ssh_alias: cisl111
   remote_root: ~/workspace/abstract_cot
   cache_root: ~/workspace/.cache/abstract_cot
   conda_env_name: abstract-cot

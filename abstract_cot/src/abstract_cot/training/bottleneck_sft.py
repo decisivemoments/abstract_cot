@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from abstract_cot.data.tokenized_features import (
     resolve_pad_token_id,
 )
 from abstract_cot.data.warmup_dataset import build_bottleneck_sft_example, initialize_random_trace
-from abstract_cot.training.distributed import DistributedContext, reduce_scalar_sum, shard_sequence_for_rank
+from abstract_cot.training.distributed import DistributedContext, reduce_scalar_sum
 from abstract_cot.training.sft_trainer import BottleneckSFTTrainer, DistillationSFTTrainer
 from abstract_cot.utils.io import write_json
 
@@ -69,27 +70,66 @@ def _parse_messages_row(row: dict, idx: int) -> SupervisedSample | None:
     )
 
 
-def load_supervised_samples(dataset_path: str, max_samples: int) -> list[SupervisedSample]:
+def _target_samples_per_rank(max_samples: int, distributed: DistributedContext) -> int:
+    if distributed.world_size <= 1:
+        return max_samples
+    if max_samples < distributed.world_size:
+        raise ValueError(
+            f"max_samples={max_samples} is smaller than world_size={distributed.world_size}; "
+            f"increase max_samples or reduce GPU count"
+        )
+    if max_samples % distributed.world_size != 0:
+        raise ValueError(
+            f"max_samples={max_samples} must be divisible by world_size={distributed.world_size} "
+            f"for distributed warm-up with equal per-rank work"
+        )
+    return max_samples // distributed.world_size
+
+
+def load_supervised_samples(
+    dataset_path: str,
+    max_samples: int,
+    distributed: DistributedContext,
+) -> list[SupervisedSample]:
     try:
         from datasets import load_dataset
+        from datasets.distributed import split_dataset_by_node
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError("datasets is required to load Hugging Face datasets") from exc
 
-    dataset = load_dataset("parquet", data_dir=dataset_path, split="train")
+    target_samples = _target_samples_per_rank(max_samples, distributed)
+    if distributed.is_main_process:
+        print(
+            {
+                "dataset_path": dataset_path,
+                "dataset_loading": "huggingface-streaming",
+                "world_size": distributed.world_size,
+                "target_samples_per_rank": target_samples,
+            }
+        )
+    dataset = load_dataset(
+        "parquet",
+        data_dir=dataset_path,
+        split="train",
+        streaming=True,
+    )
+    if distributed.world_size > 1:
+        dataset = split_dataset_by_node(dataset, rank=distributed.rank, world_size=distributed.world_size)
+
     samples: list[SupervisedSample] = []
     for idx, row in enumerate(dataset):
-        if idx >= max_samples:
-            break
         sample = _parse_messages_row(row, idx)
-        if sample is not None:
+        if sample is not None and sample.cot:
             samples.append(sample)
+            if len(samples) >= target_samples:
+                break
             continue
 
         sample_id = str(row.get("id", f"sample-{idx}"))
         prompt = row.get("prompt") or row.get("x") or ""
         cot = row.get("cot") or row.get("c") or row.get("reasoning") or ""
         answer = row.get("answer") or row.get("y") or row.get("response") or ""
-        if not prompt or not answer:
+        if not prompt or not answer or not cot:
             continue
         samples.append(
             SupervisedSample(
@@ -101,8 +141,15 @@ def load_supervised_samples(dataset_path: str, max_samples: int) -> list[Supervi
                 meta={"source_row": idx},
             )
         )
-    if not samples:
-        raise ValueError(f"no valid supervised samples found in {dataset_path}; dataset columns: {dataset.column_names}")
+        if len(samples) >= target_samples:
+            break
+    if len(samples) < target_samples:
+        raise ValueError(
+            f"only collected {len(samples)} valid samples on rank {distributed.rank}, "
+            f"but need {target_samples}. Increase max_samples or reduce GPU count."
+        )
+    if distributed.is_main_process:
+        print({"parsed_samples_per_rank": len(samples)})
     return samples
 
 
@@ -208,7 +255,7 @@ def run_minimal_warmup(
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError("torch is required for training") from exc
 
-    samples = load_supervised_samples(runtime.dataset_path, runtime.max_samples)
+    samples = load_supervised_samples(runtime.dataset_path, runtime.max_samples, distributed)
     bottleneck_batches = build_bottleneck_batches(
         samples, tokenizer, abstract_tokens, runtime.batch_size, runtime.seed
     )
@@ -216,8 +263,13 @@ def run_minimal_warmup(
         samples, tokenizer, abstract_tokens, runtime.batch_size, runtime.seed + 1
     )
 
-    bottleneck_batches = shard_sequence_for_rank(bottleneck_batches, distributed.rank, distributed.world_size)
-    distill_batches = shard_sequence_for_rank(distill_batches, distributed.rank, distributed.world_size)
+    if distributed.is_main_process:
+        print(
+            {
+                "per_rank_bottleneck_batches": len(bottleneck_batches),
+                "per_rank_distill_batches": len(distill_batches),
+            }
+        )
 
     model = maybe_wrap_fsdp(model, distributed=distributed, use_fsdp=runtime.use_fsdp)
     optimizer = torch.optim.AdamW(model.parameters(), lr=runtime.learning_rate)

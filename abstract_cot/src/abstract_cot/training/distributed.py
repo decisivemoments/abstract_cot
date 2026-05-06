@@ -74,6 +74,13 @@ def shard_sequence_for_rank(sequence: list, rank: int, world_size: int) -> list:
     return sequence[rank::world_size]
 
 
+def trim_sequence_to_even_shards(sequence: list, world_size: int) -> list:
+    if world_size <= 1:
+        return sequence
+    usable = len(sequence) - (len(sequence) % world_size)
+    return sequence[:usable]
+
+
 def reduce_scalar_sum(value: float, device: str) -> float:
     try:
         import torch

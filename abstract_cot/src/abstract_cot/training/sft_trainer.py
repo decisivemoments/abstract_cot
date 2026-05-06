@@ -48,6 +48,11 @@ class BaseSFTTrainer:
 
     def training_step(self, batch: dict[str, Any]) -> TrainingStepResult:
         prepared = self.prepare_batch(batch, as_tensors=self.as_tensors, device=self.device)
+        attention_mask = prepared.model_inputs.get("attention_mask")
+        if hasattr(attention_mask, "dtype") and hasattr(attention_mask, "is_floating_point") and attention_mask.is_floating_point():
+            first_param = next(self.model.parameters(), None)
+            if first_param is not None:
+                prepared.model_inputs["attention_mask"] = attention_mask.to(dtype=first_param.dtype)
         model_outputs = self.model(**prepared.model_inputs)
         loss = _extract_loss(model_outputs, prepared.model_inputs)
         return TrainingStepResult(

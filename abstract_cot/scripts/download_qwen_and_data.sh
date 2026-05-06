@@ -4,7 +4,7 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 ASSET_CONFIG="${ASSET_CONFIG:-${PROJECT_ROOT}/configs/data/reproduction_assets.yaml}"
-RUNTIME_CONFIG="${RUNTIME_CONFIG:-${PROJECT_ROOT}/configs/runtime/cisl113.yaml}"
+RUNTIME_CONFIG="${RUNTIME_CONFIG:-${PROJECT_ROOT}/configs/runtime/server.yaml}"
 
 read_runtime_value() {
   PYTHONPATH="${PROJECT_ROOT}/src" python "${PROJECT_ROOT}/scripts/read_runtime_config.py" \
@@ -16,6 +16,7 @@ CONDA_ENV_NAME="${CONDA_ENV_NAME:-$(read_runtime_value server.conda_env_name)}"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV_NAME}"
+export PYTHONPATH="${PROJECT_ROOT}/src"
 
 export HF_ENDPOINT
 export HF_HOME="${HF_HOME:-$HOME/workspace/.cache/abstract_cot/huggingface}"

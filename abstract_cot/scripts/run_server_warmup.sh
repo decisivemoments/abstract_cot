@@ -4,7 +4,7 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CONFIG_PATH="${CONFIG_PATH:-${PROJECT_ROOT}/configs/experiment/mvp_warmup.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/experiments/mvp_warmup}"
-RUNTIME_CONFIG="${RUNTIME_CONFIG:-${PROJECT_ROOT}/configs/runtime/cisl113.yaml}"
+RUNTIME_CONFIG="${RUNTIME_CONFIG:-${PROJECT_ROOT}/configs/runtime/server.yaml}"
 USE_FSDP="${USE_FSDP:-false}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 

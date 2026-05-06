@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CACHE_ROOT="${CACHE_ROOT:-$HOME/workspace/.cache/abstract_cot}"
-RUNTIME_CONFIG="${RUNTIME_CONFIG:-${PROJECT_ROOT}/configs/runtime/cisl113.yaml}"
+RUNTIME_CONFIG="${RUNTIME_CONFIG:-${PROJECT_ROOT}/configs/runtime/server.yaml}"
 
 read_runtime_value() {
   local key="$1"

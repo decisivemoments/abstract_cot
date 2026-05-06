@@ -14,9 +14,7 @@ abstract:
 
 warmup:
   rounds: 1
-  bottleneck_epochs: 1
-  distill_epochs: 1
-  dataset_path: server_assets/datasets/Dolci-Think-SFT-7B
+  dataset_path: server_assets/datasets/Dolci-Think-SFT-7B-cot
   batch_size: 2
   max_samples: 64
   learning_rate: 1.0e-5

@@ -15,8 +15,6 @@ def main() -> None:
     config = load_config(args.config)
     plan = WarmupPlan(
         rounds=int(config["warmup"]["rounds"]),
-        bottleneck_epochs=int(config["warmup"]["bottleneck_epochs"]),
-        distill_epochs=int(config["warmup"]["distill_epochs"]),
     )
     print(json.dumps(build_warmup_schedule(plan), indent=2))
 

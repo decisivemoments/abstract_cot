@@ -104,11 +104,30 @@ cd ~/workspace/abstract_cot
 bash scripts/download_qwen_and_data.sh
 ```
 
-This defaults to:
+This downloads:
 
 - model: `Qwen/Qwen3-0.6B`
-- warm-up data: `dolcivallone/dolci-think-sft`
-- RL data: `dolcivallone/dolci-think-rl`
+- warm-up data: `allenai/Dolci-Think-SFT-7B`
+- RL data: `allenai/Dolci-Think-RL-7B`
+
+Warm-up preprocessing is now a separate step:
+
+```bash
+cd ~/workspace/abstract_cot
+bash scripts/preprocess_warmup_data.sh
+```
+
+This produces a preprocessed Hugging Face dataset directory:
+
+`server_assets/datasets/Dolci-Think-SFT-7B-cot`
+
+The `-cot` dataset is saved with `datasets.save_to_disk(...)` and contains columns:
+
+- `sample_id`
+- `prompt`
+- `cot`
+- `answer`
+- `task_type`
 
 The download path uses `HF_ENDPOINT=https://hf-mirror.com` by default.
 
@@ -120,7 +139,7 @@ Additional model configs are available in:
 
 ### First Warm-Up Run
 
-After sync, bootstrap, and downloads complete on the server, the first smoke run is:
+After sync, bootstrap, downloads, and warm-up preprocessing complete on the server, the first smoke run is:
 
 ```bash
 cd ~/workspace/abstract_cot
@@ -140,12 +159,14 @@ The current MVP script:
 - extends the tokenizer with abstract tokens
 - resizes embeddings
 - loads the local Hugging Face parquet dataset via `datasets.load_dataset(...)`
-- uses the machine's full available CPU count for dataset loading
-- runs a minimal bottleneck/distillation SFT pass
+- loads the preprocessed `-cot` parquet dataset directly
+- partitions data into `D_t,1` and `D_t,2` for each warm-up round
+- runs Stage 1 policy-iteration warm-up round by round
+- treats `warmup.batch_size` as per-rank batch size in distributed runs
 
 Expected dataset path in the current config:
 
-`server_assets/datasets/Dolci-Think-SFT-7B`
+`server_assets/datasets/Dolci-Think-SFT-7B-cot`
 
 If the mirrored dataset layout differs after download, update [mvp_warmup.yaml](/Users/zhangjunyi/project/abstrcot/abstract_cot/configs/experiment/mvp_warmup.yaml:1) before running.
 

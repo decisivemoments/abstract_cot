@@ -78,14 +78,15 @@ def main() -> None:
         summary = run_minimal_warmup(
             model=model,
             tokenizer=tokenizer,
-            abstract_tokens=artifacts.abstract_tokens,
+            tokenizer_artifacts=artifacts,
             runtime=WarmupRuntimeConfig(
                 dataset_path=str(warmup_cfg["dataset_path"]),
                 output_dir=str(output_dir),
                 batch_size=int(warmup_cfg["batch_size"]),
                 max_samples=int(warmup_cfg["max_samples"]),
+                max_trace_length=int(config["abstract"]["max_trace_length"]),
                 learning_rate=float(warmup_cfg["learning_rate"]),
-                epochs=int(warmup_cfg["bottleneck_epochs"]) + int(warmup_cfg["distill_epochs"]),
+                rounds=int(warmup_cfg["rounds"]),
                 seed=int(config["seed"]),
                 device=distributed.device,
                 use_fsdp=use_fsdp,

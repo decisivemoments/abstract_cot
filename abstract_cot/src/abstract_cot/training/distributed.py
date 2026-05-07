@@ -92,3 +92,16 @@ def reduce_scalar_sum(value: float, device: str) -> float:
     tensor = torch.tensor([value], dtype=torch.float32, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return float(tensor.item())
+
+
+def scatter_object(value, *, distributed: DistributedContext, src: int = 0):
+    try:
+        import torch.distributed as dist
+    except ImportError:  # pragma: no cover - optional dependency
+        return value
+    if not distributed.enabled:
+        return value
+    output = [None]
+    input_values = value if distributed.rank == src else None
+    dist.scatter_object_list(output, input_values, src=src)
+    return output[0]

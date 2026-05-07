@@ -58,6 +58,11 @@ def main() -> None:
             trust_remote_code=bool(model_cfg.get("trust_remote_code", False)),
             dtype=resolve_torch_dtype(model_cfg.get("torch_dtype")),
         )
+        if bool(model_cfg.get("gradient_checkpointing", True)):
+            if hasattr(model, "gradient_checkpointing_enable"):
+                model.gradient_checkpointing_enable()
+            if hasattr(model, "config"):
+                model.config.use_cache = False
 
         abstract_cfg = config["abstract"]
         token_spec = AbstractTokenSpec(

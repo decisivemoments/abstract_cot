@@ -15,8 +15,6 @@ from abstract_cot.modeling.attention_mask import (
     SEGMENT_ANSWER,
     SEGMENT_COT,
     SEGMENT_PROMPT,
-    SegmentBoundaries,
-    build_bottleneck_attention_mask,
 )
 
 IGNORE_INDEX = -100
@@ -80,12 +78,6 @@ def build_bottleneck_feature(
         SegmentEncoding(answer_ids, SEGMENT_ANSWER, True),
     ]
     input_ids, labels, position_ids, segment_ids, attention_mask = _merge_segment_encodings(segments)
-    boundaries = SegmentBoundaries(
-        prompt_length=len(prompt_ids),
-        cot_length=len(cot_ids),
-        abstract_length=len(abstract_ids),
-        answer_length=len(answer_ids),
-    )
     return BottleneckTokenizedFeature(
         sample_id=example.sample_id,
         round_idx=example.round_idx,
@@ -94,7 +86,6 @@ def build_bottleneck_feature(
         position_ids=position_ids,
         segment_ids=segment_ids,
         attention_mask=attention_mask,
-        bottleneck_attention_mask=build_bottleneck_attention_mask(boundaries),
     )
 
 

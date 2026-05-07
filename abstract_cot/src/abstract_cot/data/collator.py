@@ -10,15 +10,6 @@ def _pad_1d(values: list[int], target_length: int, pad_value: int) -> list[int]:
     return values + [pad_value] * (target_length - len(values))
 
 
-def _pad_2d_bool(mask: list[list[bool]], target_length: int) -> list[list[bool]]:
-    padded_rows: list[list[bool]] = []
-    for row in mask:
-        padded_rows.append(row + [False] * (target_length - len(row)))
-    for _ in range(target_length - len(mask)):
-        padded_rows.append([False] * target_length)
-    return padded_rows
-
-
 def collate_distillation_features(
     features: list[DistillationTokenizedFeature],
     pad_token_id: int,
@@ -39,9 +30,4 @@ def collate_bottleneck_features(
     features: list[BottleneckTokenizedFeature],
     pad_token_id: int,
 ) -> dict[str, Any]:
-    batch = collate_distillation_features(features, pad_token_id)
-    max_length = max(len(feature.input_ids) for feature in features)
-    batch["bottleneck_attention_mask"] = [
-        _pad_2d_bool(feature.bottleneck_attention_mask, max_length) for feature in features
-    ]
-    return batch
+    return collate_distillation_features(features, pad_token_id)

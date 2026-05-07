@@ -3,7 +3,7 @@ server:
   remote_root: ~/workspace/abstract_cot
   cache_root: ~/workspace/.cache/abstract_cot
   conda_env_name: abstract-cot
-  python_version: "3.11"
+  python_version: 3.11
 
 downloads:
   provider: hf-mirror

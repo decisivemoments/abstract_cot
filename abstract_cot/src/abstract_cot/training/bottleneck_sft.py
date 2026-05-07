@@ -16,7 +16,7 @@ from abstract_cot.data.tokenized_features import (
 )
 from abstract_cot.data.warmup_dataset import build_bottleneck_sft_example, initialize_random_trace
 from abstract_cot.decoding.constrained_decoder import AbstractDecodingConfig, next_abstract_logits
-from abstract_cot.training.distributed import DistributedContext, reduce_scalar_sum
+from abstract_cot.training.distributed import DistributedContext, reduce_scalar_sum, scatter_object
 from abstract_cot.training.sft_trainer import BottleneckSFTTrainer, DistillationSFTTrainer
 from abstract_cot.tokenization.tokenizer_extension import TokenizerArtifacts
 from abstract_cot.utils.io import write_json
@@ -73,6 +73,15 @@ def _target_total_samples(
     return usable
 
 
+def _materialize_rows(dataset) -> list[dict[str, Any]]:
+    columns = dataset[:]
+    row_count = len(next(iter(columns.values()))) if columns else 0
+    return [
+        {key: values[row_idx] for key, values in columns.items()}
+        for row_idx in range(row_count)
+    ]
+
+
 def load_warmup_round_datasets(
     dataset_path: str,
     *,
@@ -103,29 +112,47 @@ def load_warmup_round_datasets(
             }
         )
 
-    dataset = load_from_disk(dataset_path)
-    required_columns = {"sample_id", "prompt", "cot", "answer"}
-    missing = sorted(required_columns.difference(dataset.column_names))
-    if missing:
-        raise ValueError(
-            f"preprocessed warm-up dataset is missing required columns: {missing}; "
-            f"expected a -cot dataset prepared by scripts/preprocess_dolci_think_sft.py"
-        )
-    if len(dataset) < total_target:
-        raise ValueError(
-            f"preprocessed dataset only has {len(dataset)} rows, but warm-up needs {total_target}"
-        )
+    local_rows: list[dict[str, Any]]
+    if distributed.enabled:
+        per_rank_rows = None
+        if distributed.is_main_process:
+            dataset = load_from_disk(dataset_path)
+            required_columns = {"sample_id", "prompt", "cot", "answer"}
+            missing = sorted(required_columns.difference(dataset.column_names))
+            if missing:
+                raise ValueError(
+                    f"preprocessed warm-up dataset is missing required columns: {missing}; "
+                    f"expected a -cot dataset prepared by scripts/preprocess_dolci_think_sft.py"
+                )
+            if len(dataset) < total_target:
+                raise ValueError(
+                    f"preprocessed dataset only has {len(dataset)} rows, but warm-up needs {total_target}"
+                )
+            dataset = dataset.select(range(total_target))
+            rows = _materialize_rows(dataset)
+            per_rank_size = total_target // distributed.world_size
+            per_rank_rows = [
+                rows[rank_idx * per_rank_size : (rank_idx + 1) * per_rank_size]
+                for rank_idx in range(distributed.world_size)
+            ]
+        local_rows = scatter_object(per_rank_rows, distributed=distributed, src=0)
+    else:
+        dataset = load_from_disk(dataset_path)
+        required_columns = {"sample_id", "prompt", "cot", "answer"}
+        missing = sorted(required_columns.difference(dataset.column_names))
+        if missing:
+            raise ValueError(
+                f"preprocessed warm-up dataset is missing required columns: {missing}; "
+                f"expected a -cot dataset prepared by scripts/preprocess_dolci_think_sft.py"
+            )
+        if len(dataset) < total_target:
+            raise ValueError(
+                f"preprocessed dataset only has {len(dataset)} rows, but warm-up needs {total_target}"
+            )
+        dataset = dataset.select(range(total_target))
+        local_rows = _materialize_rows(dataset)
 
-    dataset = dataset.select(range(total_target))
-
-    if distributed.world_size > 1:
-        dataset = dataset.shard(
-            num_shards=distributed.world_size,
-            index=distributed.rank,
-            contiguous=True,
-        )
-
-    local_count = len(dataset)
+    local_count = len(local_rows)
     if local_count % (2 * rounds * batch_size) != 0:
         raise ValueError(
             f"local dataset size {local_count} on rank {distributed.rank} must be divisible by "
@@ -140,8 +167,8 @@ def load_warmup_round_datasets(
     for round_idx in range(rounds):
         first_start = round_idx * 2 * per_subset_size
         second_start = first_start + per_subset_size
-        d_t1 = dataset.select(range(first_start, first_start + per_subset_size))
-        d_t2 = dataset.select(range(second_start, second_start + per_subset_size))
+        d_t1 = local_rows[first_start : first_start + per_subset_size]
+        d_t2 = local_rows[second_start : second_start + per_subset_size]
         round_datasets.append((d_t1, d_t2))
     return round_datasets
 
@@ -214,6 +241,31 @@ def generate_on_policy_trace(
 
 def _loss_scalar(loss) -> float:
     return float(loss.detach().cpu().item()) if hasattr(loss, "detach") else float(loss)
+
+
+def _debug_cuda_enabled() -> bool:
+    return os.environ.get("ABSTRACT_COT_DEBUG_CUDA_MEM", "").strip() in {"1", "true", "TRUE", "yes", "YES"}
+
+
+def _tensor_shape(value):
+    return tuple(value.shape) if hasattr(value, "shape") else None
+
+
+def _cuda_memory_snapshot(device: str) -> dict[str, float | str]:
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - optional dependency
+        return {}
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        return {}
+    torch.cuda.synchronize(device)
+    return {
+        "device": device,
+        "allocated_mb": round(torch.cuda.memory_allocated(device) / (1024 ** 2), 2),
+        "reserved_mb": round(torch.cuda.memory_reserved(device) / (1024 ** 2), 2),
+        "max_allocated_mb": round(torch.cuda.max_memory_allocated(device) / (1024 ** 2), 2),
+        "max_reserved_mb": round(torch.cuda.max_memory_reserved(device) / (1024 ** 2), 2),
+    }
 
 
 def _supervised_collate(rows: list[dict[str, Any]]) -> list[SupervisedSample]:
@@ -390,11 +442,51 @@ def run_sft_phase(
         iterable = tqdm(dataloader, desc=phase_name, leave=False)
     for batch in iterable:
         optimizer.zero_grad()
-        result = trainer.training_step(batch)
-        loss = result.loss
-        if hasattr(loss, "backward"):
-            loss.backward()
-            optimizer.step()
+        try:
+            result = trainer.training_step(batch)
+            loss = result.loss
+            if hasattr(loss, "backward"):
+                if _debug_cuda_enabled():
+                    print(
+                        {
+                            "stage": "before_backward",
+                            "phase": phase_name,
+                            "cuda_mem": _cuda_memory_snapshot(distributed.device),
+                        }
+                    )
+                loss.backward()
+                if _debug_cuda_enabled():
+                    print(
+                        {
+                            "stage": "after_backward",
+                            "phase": phase_name,
+                            "cuda_mem": _cuda_memory_snapshot(distributed.device),
+                        }
+                    )
+                optimizer.step()
+                if _debug_cuda_enabled():
+                    print(
+                        {
+                            "stage": "after_optimizer_step",
+                            "phase": phase_name,
+                            "cuda_mem": _cuda_memory_snapshot(distributed.device),
+                        }
+                    )
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                print(
+                    {
+                        "stage": "oom",
+                        "phase": phase_name,
+                        "device": distributed.device,
+                        "batch_input_ids_shape": _tensor_shape(batch.get("input_ids")),
+                        "batch_attention_mask_shape": _tensor_shape(batch.get("attention_mask")),
+                        "batch_segment_ids_shape": _tensor_shape(batch.get("segment_ids")),
+                        "batch_max_seq_len": max((len(row) for row in batch.get("input_ids", [])), default=0),
+                        "cuda_mem": _cuda_memory_snapshot(distributed.device),
+                    }
+                )
+            raise
         losses.append(_loss_scalar(loss))
         if tqdm is not None and distributed.is_main_process and hasattr(iterable, "set_postfix"):
             iterable.set_postfix(loss=f"{losses[-1]:.4f}")

@@ -67,7 +67,7 @@ class TokenizedFeature:
 
 @dataclass(frozen=True)
 class BottleneckTokenizedFeature(TokenizedFeature):
-    bottleneck_attention_mask: list[list[bool]]
+    pass
 
 
 @dataclass(frozen=True)

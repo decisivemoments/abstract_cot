@@ -6,6 +6,7 @@ model:
   tokenizer_path: server_assets/models/Qwen3-0.6B
   trust_remote_code: true
   torch_dtype: bfloat16
+  gradient_checkpointing: true
 
 abstract:
   vocab_size: 64
@@ -13,10 +14,10 @@ abstract:
   max_trace_length: 128
 
 warmup:
-  rounds: 1
+  rounds: 4
   dataset_path: server_assets/datasets/Dolci-Think-SFT-7B-cot
-  batch_size: 2
-  max_samples: 64
+  batch_size: 1
+  max_samples: 8192
   learning_rate: 1.0e-5
 
 distributed:

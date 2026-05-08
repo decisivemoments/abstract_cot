@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from abstract_cot.data.schema import BottleneckTokenizedFeature, DistillationTokenizedFeature
+from abstract_cot.data.schema import DistillationTokenizedFeature
 from abstract_cot.data.tokenized_features import IGNORE_INDEX
 
 
@@ -24,10 +24,3 @@ def collate_distillation_features(
         "segment_ids": [_pad_1d(feature.segment_ids, max_length, -1) for feature in features],
         "attention_mask": [_pad_1d(feature.attention_mask, max_length, 0) for feature in features],
     }
-
-
-def collate_bottleneck_features(
-    features: list[BottleneckTokenizedFeature],
-    pad_token_id: int,
-) -> dict[str, Any]:
-    return collate_distillation_features(features, pad_token_id)

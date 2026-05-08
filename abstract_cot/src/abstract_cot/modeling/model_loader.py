@@ -18,12 +18,16 @@ def resolve_torch_dtype(dtype_name: str | None):
     return mapping[dtype_name]
 
 
-def load_causal_lm(model_name_or_path: str, **kwargs):
+def load_causal_lm(model_name_or_path: str, attn_implementation: str = "sdpa", **kwargs):
     try:
         from transformers import AutoModelForCausalLM
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError("transformers is required to load the model") from exc
-    return AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
+    return AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        attn_implementation=attn_implementation,
+        **kwargs,
+    )
 
 
 def load_tokenizer(tokenizer_name_or_path: str, **kwargs):

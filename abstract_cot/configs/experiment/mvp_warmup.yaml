@@ -19,6 +19,12 @@ warmup:
   batch_size: 1
   max_samples: 8192
   learning_rate: 1.0e-5
+  max_steps_per_phase: null
+
+profiling:
+  memory_snapshot:
+    enabled: false
+    max_entries: 100000
 
 distributed:
   use_fsdp: false

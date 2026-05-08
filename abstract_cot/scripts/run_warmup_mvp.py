@@ -57,10 +57,18 @@ def main() -> None:
             model_cfg["base_model"],
             trust_remote_code=bool(model_cfg.get("trust_remote_code", False)),
             dtype=resolve_torch_dtype(model_cfg.get("torch_dtype")),
+            attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
         )
         if bool(model_cfg.get("gradient_checkpointing", True)):
             if hasattr(model, "gradient_checkpointing_enable"):
                 model.gradient_checkpointing_enable()
+                if distributed.is_main_process:
+                    gc_effective = getattr(
+                        getattr(model, "model", model),
+                        "gradient_checkpointing",
+                        False,
+                    )
+                    print({"gradient_checkpointing": gc_effective})
             if hasattr(model, "config"):
                 model.config.use_cache = False
 
@@ -79,6 +87,8 @@ def main() -> None:
             model = model.to(distributed.device)
 
         warmup_cfg = config["warmup"]
+        profiling_cfg = config.get("profiling", {})
+        memory_snapshot_cfg = profiling_cfg.get("memory_snapshot", {})
         use_fsdp = bool(config.get("distributed", {}).get("use_fsdp", False) or distributed.enabled)
         summary = run_minimal_warmup(
             model=model,
@@ -95,6 +105,13 @@ def main() -> None:
                 seed=int(config["seed"]),
                 device=distributed.device,
                 use_fsdp=use_fsdp,
+                max_steps_per_phase=(
+                    int(warmup_cfg["max_steps_per_phase"])
+                    if warmup_cfg.get("max_steps_per_phase") is not None
+                    else None
+                ),
+                memory_snapshot_enabled=bool(memory_snapshot_cfg.get("enabled", False)),
+                memory_snapshot_max_entries=int(memory_snapshot_cfg.get("max_entries", 100000)),
             ),
             distributed=distributed,
         )

@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import random
 
-from abstract_cot.data.collator import collate_bottleneck_features, collate_distillation_features
+from abstract_cot.data.collator import collate_distillation_features
 from abstract_cot.data.distill_dataset import build_distillation_example
 from abstract_cot.data.schema import SupervisedSample
-from abstract_cot.data.tokenized_features import build_bottleneck_feature, build_distillation_feature
+from abstract_cot.data.tokenized_features import (
+    build_bottleneck_y_feature,
+    build_bottleneck_z_feature,
+    build_distillation_feature,
+)
 from abstract_cot.data.warmup_dataset import build_bottleneck_sft_example, initialize_random_trace
 from abstract_cot.tokenization.abstract_vocab import build_abstract_vocabulary
-from abstract_cot.training.sft_trainer import BottleneckSFTTrainer, DistillationSFTTrainer
+from abstract_cot.training.sft_trainer import DistillationSFTTrainer
 
 
 class WhitespaceTokenizer:
@@ -53,9 +57,17 @@ def main() -> None:
         round_idx=1,
     )
 
-    bottleneck_feature = build_bottleneck_feature(build_bottleneck_sft_example(sample, trace), tokenizer)
-    bottleneck_batch = collate_bottleneck_features([bottleneck_feature], pad_token_id=tokenizer.pad_token_id)
-    bottleneck_result = BottleneckSFTTrainer(FakeModel()).training_step(bottleneck_batch)
+    bottleneck_example = build_bottleneck_sft_example(sample, trace)
+    bottleneck_z_batch = collate_distillation_features(
+        [build_bottleneck_z_feature(bottleneck_example, tokenizer)],
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    bottleneck_y_batch = collate_distillation_features(
+        [build_bottleneck_y_feature(bottleneck_example, tokenizer)],
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    bottleneck_z_result = DistillationSFTTrainer(FakeModel()).training_step(bottleneck_z_batch)
+    bottleneck_y_result = DistillationSFTTrainer(FakeModel()).training_step(bottleneck_y_batch)
 
     distill_feature = build_distillation_feature(build_distillation_example(sample, trace), tokenizer)
     distill_batch = collate_distillation_features([distill_feature], pad_token_id=tokenizer.pad_token_id)
@@ -64,14 +76,12 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "bottleneck_loss": bottleneck_result.loss,
+                "bottleneck_z_loss": bottleneck_z_result.loss,
+                "bottleneck_y_loss": bottleneck_y_result.loss,
                 "distill_loss": distill_result.loss,
-                "bottleneck_received_keys": bottleneck_result.model_outputs["received_keys"],
+                "bottleneck_z_received_keys": bottleneck_z_result.model_outputs["received_keys"],
+                "bottleneck_y_received_keys": bottleneck_y_result.model_outputs["received_keys"],
                 "distill_received_keys": distill_result.model_outputs["received_keys"],
-                "bottleneck_mask_shape": [
-                    len(bottleneck_batch["bottleneck_attention_mask"][0]),
-                    len(bottleneck_batch["bottleneck_attention_mask"][0][0]),
-                ],
             },
             indent=2,
         )

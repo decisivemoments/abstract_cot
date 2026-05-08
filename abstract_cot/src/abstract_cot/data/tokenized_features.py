@@ -62,30 +62,56 @@ def _merge_segment_encodings(segments: list[SegmentEncoding]) -> tuple[list[int]
     return input_ids, labels, position_ids, segment_ids, attention_mask
 
 
-def build_bottleneck_feature(
-    example: BottleneckSFTExample,
-    tokenizer: SupportsEncode,
-) -> BottleneckTokenizedFeature:
-    prompt_ids = tokenizer.encode(example.segments.prompt, add_special_tokens=False)
-    cot_ids = tokenizer.encode(example.segments.cot, add_special_tokens=False)
-    abstract_ids = tokenizer.encode(example.segments.abstract_trace, add_special_tokens=False)
-    answer_ids = tokenizer.encode(example.segments.answer, add_special_tokens=False)
-
-    segments = [
-        SegmentEncoding(prompt_ids, SEGMENT_PROMPT, False),
-        SegmentEncoding(cot_ids, SEGMENT_COT, False),
-        SegmentEncoding(abstract_ids, SEGMENT_ABSTRACT, True),
-        SegmentEncoding(answer_ids, SEGMENT_ANSWER, True),
-    ]
+def _build_tokenized_feature_from_segments(
+    *,
+    sample_id: str,
+    round_idx: int,
+    segments: list[SegmentEncoding],
+    feature_cls,
+):
     input_ids, labels, position_ids, segment_ids, attention_mask = _merge_segment_encodings(segments)
-    return BottleneckTokenizedFeature(
-        sample_id=example.sample_id,
-        round_idx=example.round_idx,
+    return feature_cls(
+        sample_id=sample_id,
+        round_idx=round_idx,
         input_ids=input_ids,
         labels=labels,
         position_ids=position_ids,
         segment_ids=segment_ids,
         attention_mask=attention_mask,
+    )
+
+
+def build_bottleneck_z_feature(
+    example: BottleneckSFTExample,
+    tokenizer: SupportsEncode,
+) -> BottleneckTokenizedFeature:
+    segments = [
+        _encode_segment(tokenizer, example.segments.prompt, SEGMENT_PROMPT, False),
+        _encode_segment(tokenizer, example.segments.cot, SEGMENT_COT, False),
+        _encode_segment(tokenizer, example.segments.abstract_trace, SEGMENT_ABSTRACT, True),
+    ]
+    return _build_tokenized_feature_from_segments(
+        sample_id=example.sample_id,
+        round_idx=example.round_idx,
+        segments=segments,
+        feature_cls=BottleneckTokenizedFeature,
+    )
+
+
+def build_bottleneck_y_feature(
+    example: BottleneckSFTExample,
+    tokenizer: SupportsEncode,
+) -> BottleneckTokenizedFeature:
+    segments = [
+        _encode_segment(tokenizer, example.segments.prompt, SEGMENT_PROMPT, False),
+        _encode_segment(tokenizer, example.segments.abstract_trace, SEGMENT_ABSTRACT, False),
+        _encode_segment(tokenizer, example.segments.answer, SEGMENT_ANSWER, True),
+    ]
+    return _build_tokenized_feature_from_segments(
+        sample_id=example.sample_id,
+        round_idx=example.round_idx,
+        segments=segments,
+        feature_cls=BottleneckTokenizedFeature,
     )
 
 
@@ -98,15 +124,11 @@ def build_distillation_feature(
         _encode_segment(tokenizer, example.abstract_trace, SEGMENT_ABSTRACT, True),
         _encode_segment(tokenizer, example.answer, SEGMENT_ANSWER, True),
     ]
-    input_ids, labels, position_ids, segment_ids, attention_mask = _merge_segment_encodings(segments)
-    return DistillationTokenizedFeature(
+    return _build_tokenized_feature_from_segments(
         sample_id=example.sample_id,
         round_idx=example.round_idx,
-        input_ids=input_ids,
-        labels=labels,
-        position_ids=position_ids,
-        segment_ids=segment_ids,
-        attention_mask=attention_mask,
+        segments=segments,
+        feature_cls=DistillationTokenizedFeature,
     )
 
 

@@ -7,7 +7,6 @@ from typing import Any, Callable
 from .forward_batch import (
     PreparedBatch,
     compute_causal_lm_loss_from_logits,
-    prepare_bottleneck_batch,
     prepare_distillation_batch,
 )
 
@@ -95,6 +94,13 @@ class BaseSFTTrainer:
                     "cuda_mem": _cuda_memory_snapshot(self.device),
                 }
             )
+            print(
+                {
+                    "stage": "before_model_forward",
+                    "device": self.device,
+                    "cuda_mem": _cuda_memory_snapshot(self.device),
+                }
+            )
         model_outputs = self.model(**prepared.model_inputs)
         if _debug_cuda_enabled():
             print(
@@ -105,23 +111,20 @@ class BaseSFTTrainer:
                 }
             )
         loss = _extract_loss(model_outputs, prepared.model_inputs)
+        if _debug_cuda_enabled():
+            print(
+                {
+                    "stage": "after_loss_extraction",
+                    "device": self.device,
+                    "loss_type": type(loss).__name__,
+                    "cuda_mem": _cuda_memory_snapshot(self.device),
+                }
+            )
         return TrainingStepResult(
             loss=loss,
             metadata=prepared.metadata,
             model_outputs=model_outputs,
         )
-
-
-class BottleneckSFTTrainer(BaseSFTTrainer):
-    def __init__(self, model, *, as_tensors: bool = False, device: str | None = None) -> None:
-        super().__init__(
-            model,
-            prepare_batch=prepare_bottleneck_batch,
-            as_tensors=as_tensors,
-            device=device,
-        )
-
-
 class DistillationSFTTrainer(BaseSFTTrainer):
     def __init__(self, model, *, as_tensors: bool = False, device: str | None = None) -> None:
         super().__init__(

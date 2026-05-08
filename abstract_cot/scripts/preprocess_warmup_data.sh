@@ -5,7 +5,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 RUNTIME_CONFIG="${RUNTIME_CONFIG:-${PROJECT_ROOT}/configs/runtime/server.yaml}"
 INPUT_DIR="${INPUT_DIR:-${PROJECT_ROOT}/server_assets/datasets/Dolci-Think-SFT-7B}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/server_assets/datasets/Dolci-Think-SFT-7B-cot}"
-MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-8192}"
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-1024}"
 NUM_PROC="${NUM_PROC:-}"
 
 read_runtime_value() {

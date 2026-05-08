@@ -5,19 +5,20 @@ import random
 from dataclasses import dataclass
 from typing import Any
 
-from abstract_cot.data.collator import collate_bottleneck_features, collate_distillation_features
+from abstract_cot.data.collator import collate_distillation_features
 from abstract_cot.data.prompt_formatter import render_abstract_trace
 from abstract_cot.data.distill_dataset import build_distillation_example
 from abstract_cot.data.schema import SupervisedSample, TraceSample
 from abstract_cot.data.tokenized_features import (
-    build_bottleneck_feature,
+    build_bottleneck_y_feature,
+    build_bottleneck_z_feature,
     build_distillation_feature,
     resolve_pad_token_id,
 )
 from abstract_cot.data.warmup_dataset import build_bottleneck_sft_example, initialize_random_trace
 from abstract_cot.decoding.constrained_decoder import AbstractDecodingConfig, next_abstract_logits
 from abstract_cot.training.distributed import DistributedContext, reduce_scalar_sum, scatter_object
-from abstract_cot.training.sft_trainer import BottleneckSFTTrainer, DistillationSFTTrainer
+from abstract_cot.training.sft_trainer import DistillationSFTTrainer
 from abstract_cot.tokenization.tokenizer_extension import TokenizerArtifacts
 from abstract_cot.utils.io import write_json
 
@@ -34,6 +35,9 @@ class WarmupRuntimeConfig:
     seed: int
     device: str = "cpu"
     use_fsdp: bool = False
+    max_steps_per_phase: int | None = None
+    memory_snapshot_enabled: bool = False
+    memory_snapshot_max_entries: int = 100000
 
 
 def _rows_to_supervised_samples(rows: list[dict[str, Any]]) -> list[SupervisedSample]:
@@ -178,28 +182,51 @@ def _trace_text_from_ids(tokenizer, token_ids: list[int], artifacts: TokenizerAr
     return render_abstract_trace(tokens, begin_token=artifacts.begin_token, end_token=artifacts.end_token)
 
 
-def generate_on_policy_trace(
+def _constrain_next_tokens(logits, generated_lengths: list[int], finished: list[bool], decoding_config: AbstractDecodingConfig):
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("torch is required for batched abstract trace generation") from exc
+
+    next_token_ids: list[int] = []
+    for row_idx, generated_length in enumerate(generated_lengths):
+        if finished[row_idx]:
+            next_token_ids.append(decoding_config.end_token_id)
+            continue
+        constrained_logits = next_abstract_logits(logits[row_idx : row_idx + 1], generated_length, decoding_config)
+        next_token_ids.append(int(torch.argmax(constrained_logits, dim=-1).item()))
+    return next_token_ids
+
+
+def generate_on_policy_traces(
     model,
     tokenizer,
-    sample: SupervisedSample,
+    samples: list[SupervisedSample],
     *,
     artifacts: TokenizerArtifacts,
     max_trace_length: int,
     device: str,
     include_cot: bool,
     round_idx: int,
-) -> TraceSample:
+) -> list[TraceSample]:
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError("torch is required for on-policy abstract trace generation") from exc
 
-    prompt_text = sample.prompt
-    if include_cot and sample.cot:
-        prompt_text = f"{sample.prompt}\n{sample.cot}"
-    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-    input_ids = prompt_ids + [artifacts.begin_token_id]
-    generated_ids: list[int] = []
+    if not samples:
+        return []
+
+    prompt_texts: list[str] = []
+    for sample in samples:
+        prompt_text = sample.prompt
+        if include_cot and sample.cot:
+            prompt_text = f"{sample.prompt}\n{sample.cot}"
+        prompt_texts.append(prompt_text)
+
+    generated_ids: list[list[int]] = [[] for _ in samples]
+    generated_lengths = [0 for _ in samples]
+    finished = [False for _ in samples]
     decoding_config = AbstractDecodingConfig(
         abstract_token_ids=artifacts.abstract_token_ids,
         end_token_id=artifacts.end_token_id,
@@ -209,34 +236,88 @@ def generate_on_policy_trace(
     was_training = model.training
     model.eval()
     with torch.no_grad():
-        tensor = torch.tensor([input_ids], device=device, dtype=torch.long)
-        outputs = model(input_ids=tensor, use_cache=True)
+        original_padding_side = getattr(tokenizer, "padding_side", "right")
+        try:
+            tokenizer.padding_side = "left"
+            encoded = tokenizer(
+                prompt_texts,
+                add_special_tokens=False,
+                padding=True,
+                return_tensors="pt",
+            )
+        finally:
+            tokenizer.padding_side = original_padding_side
+
+        input_tensor = encoded["input_ids"].to(device=device, dtype=torch.long)
+        attention_mask = encoded["attention_mask"].to(device=device, dtype=torch.long)
+        begin_token_column = torch.full(
+            (len(samples), 1),
+            artifacts.begin_token_id,
+            device=device,
+            dtype=torch.long,
+        )
+        input_tensor = torch.cat([input_tensor, begin_token_column], dim=1)
+        attention_mask = torch.cat(
+            [
+                attention_mask,
+                torch.ones((len(samples), 1), device=device, dtype=attention_mask.dtype),
+            ],
+            dim=1,
+        )
+        prompt_lengths = attention_mask.sum(dim=1).tolist()
+        outputs = model(input_ids=input_tensor, attention_mask=attention_mask, use_cache=True)
+        batch_indices = torch.arange(len(samples), device=device)
+        last_positions = torch.tensor([length - 1 for length in prompt_lengths], device=device, dtype=torch.long)
         for _ in range(max_trace_length + 1):
-            logits = outputs.logits[:, -1, :]
-            constrained_logits = next_abstract_logits(logits, len(generated_ids), decoding_config)
-            next_token_id = int(torch.argmax(constrained_logits, dim=-1).item())
-            if next_token_id == artifacts.end_token_id:
+            if outputs.logits.size(1) == 1:
+                logits = outputs.logits[:, -1, :]
+            else:
+                logits = outputs.logits[batch_indices, last_positions, :]
+            next_token_ids = _constrain_next_tokens(logits, generated_lengths, finished, decoding_config)
+            next_tensor = torch.tensor(next_token_ids, device=device, dtype=torch.long).unsqueeze(1)
+
+            all_finished = True
+            for row_idx, next_token_id in enumerate(next_token_ids):
+                if finished[row_idx]:
+                    continue
+                if next_token_id == artifacts.end_token_id:
+                    finished[row_idx] = True
+                    continue
+                generated_ids[row_idx].append(next_token_id)
+                generated_lengths[row_idx] += 1
+                all_finished = False
+            if all(finished) or all_finished:
                 break
-            generated_ids.append(next_token_id)
-            next_tensor = torch.tensor([[next_token_id]], device=device, dtype=torch.long)
+            attention_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.ones((len(samples), 1), device=device, dtype=attention_mask.dtype),
+                ],
+                dim=1,
+            )
             outputs = model(
                 input_ids=next_tensor,
+                attention_mask=attention_mask,
                 past_key_values=outputs.past_key_values,
                 use_cache=True,
             )
+            prompt_lengths = [length + 1 for length in prompt_lengths]
     if was_training:
         model.train()
 
-    return TraceSample(
-        sample_id=sample.sample_id,
-        prompt=sample.prompt,
-        answer=sample.answer,
-        abstract_trace_text=_trace_text_from_ids(tokenizer, generated_ids, artifacts),
-        abstract_trace_ids=generated_ids,
-        stage="on_policy",
-        round_idx=round_idx,
-        cot=sample.cot,
-    )
+    return [
+        TraceSample(
+            sample_id=sample.sample_id,
+            prompt=sample.prompt,
+            answer=sample.answer,
+            abstract_trace_text=_trace_text_from_ids(tokenizer, sample_generated_ids, artifacts),
+            abstract_trace_ids=sample_generated_ids,
+            stage="on_policy",
+            round_idx=round_idx,
+            cot=sample.cot,
+        )
+        for sample, sample_generated_ids in zip(samples, generated_ids, strict=True)
+    ]
 
 
 def _loss_scalar(loss) -> float:
@@ -245,10 +326,6 @@ def _loss_scalar(loss) -> float:
 
 def _debug_cuda_enabled() -> bool:
     return os.environ.get("ABSTRACT_COT_DEBUG_CUDA_MEM", "").strip() in {"1", "true", "TRUE", "yes", "YES"}
-
-
-def _tensor_shape(value):
-    return tuple(value.shape) if hasattr(value, "shape") else None
 
 
 def _cuda_memory_snapshot(device: str) -> dict[str, float | str]:
@@ -266,6 +343,95 @@ def _cuda_memory_snapshot(device: str) -> dict[str, float | str]:
         "max_allocated_mb": round(torch.cuda.max_memory_allocated(device) / (1024 ** 2), 2),
         "max_reserved_mb": round(torch.cuda.max_memory_reserved(device) / (1024 ** 2), 2),
     }
+
+
+def _log_cuda_mem(stage: str, *, device: str, phase_name: str, **extra) -> None:
+    if not _debug_cuda_enabled():
+        return
+    payload = {
+        "stage": stage,
+        "phase": phase_name,
+        "cuda_mem": _cuda_memory_snapshot(device),
+    }
+    payload.update(extra)
+    print(payload)
+
+
+class MemorySnapshotRecorder:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        output_dir: str,
+        device: str,
+        rank: int,
+        max_entries: int,
+    ) -> None:
+        self.enabled = enabled
+        self.output_dir = output_dir
+        self.device = device
+        self.rank = rank
+        self.max_entries = max_entries
+
+    def start(self, phase_name: str) -> None:
+        if not self.enabled:
+            return
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - optional dependency
+            return
+        if not self.device.startswith("cuda") or not torch.cuda.is_available():
+            return
+        memory = getattr(torch.cuda, "memory", None)
+        if memory is None or not hasattr(memory, "_record_memory_history"):
+            print({"memory_snapshot": "unsupported", "phase": phase_name, "rank": self.rank})
+            return
+        torch.cuda.synchronize(self.device)
+        memory._record_memory_history(
+            enabled="all",
+            context="all",
+            stacks="all",
+            max_entries=self.max_entries,
+        )
+        print({"memory_snapshot": "recording_started", "phase": phase_name, "rank": self.rank})
+
+    def dump(self, phase_name: str, *, tag: str) -> str | None:
+        if not self.enabled:
+            return None
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - optional dependency
+            return None
+        if not self.device.startswith("cuda") or not torch.cuda.is_available():
+            return None
+        memory = getattr(torch.cuda, "memory", None)
+        if memory is None or not hasattr(memory, "_dump_snapshot"):
+            return None
+        snapshot_dir = os.path.join(self.output_dir, "memory_snapshots")
+        os.makedirs(snapshot_dir, exist_ok=True)
+        safe_phase_name = phase_name.replace("/", "_")
+        filename = f"rank{self.rank}-{safe_phase_name}-{tag}.pickle"
+        path = os.path.join(snapshot_dir, filename)
+        torch.cuda.synchronize(self.device)
+        memory._dump_snapshot(path)
+        print({"memory_snapshot": "dumped", "phase": phase_name, "rank": self.rank, "path": path})
+        return path
+
+    def stop(self, phase_name: str) -> None:
+        if not self.enabled:
+            return
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - optional dependency
+            return
+        if not self.device.startswith("cuda") or not torch.cuda.is_available():
+            return
+        memory = getattr(torch.cuda, "memory", None)
+        if memory is None or not hasattr(memory, "_record_memory_history"):
+            return
+        torch.cuda.synchronize(self.device)
+        memory._record_memory_history(enabled=None)
+        print({"memory_snapshot": "recording_stopped", "phase": phase_name, "rank": self.rank})
 
 
 def _supervised_collate(rows: list[dict[str, Any]]) -> list[SupervisedSample]:
@@ -288,88 +454,7 @@ def _build_phase_sample_loader(dataset, batch_size: int):
     )
 
 
-class _BottleneckFeatureDataset:
-    def __init__(self, samples: list[SupervisedSample], traces: list[TraceSample], tokenizer) -> None:
-        self.features = [
-            build_bottleneck_feature(build_bottleneck_sft_example(sample, trace), tokenizer)
-            for sample, trace in zip(samples, traces, strict=True)
-        ]
-
-    def __len__(self) -> int:
-        return len(self.features)
-
-    def __getitem__(self, idx: int):
-        return self.features[idx]
-
-
-class _DistillationFeatureDataset:
-    def __init__(self, samples: list[SupervisedSample], traces: list[TraceSample], tokenizer) -> None:
-        self.features = [
-            build_distillation_feature(build_distillation_example(sample, trace), tokenizer)
-            for sample, trace in zip(samples, traces, strict=True)
-        ]
-
-    def __len__(self) -> int:
-        return len(self.features)
-
-    def __getitem__(self, idx: int):
-        return self.features[idx]
-
-
-def _build_bottleneck_train_loader(
-    samples: list[SupervisedSample],
-    traces: list[TraceSample],
-    tokenizer,
-    batch_size: int,
-):
-    try:
-        from torch.utils.data import DataLoader
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError("torch is required to construct dataloaders") from exc
-
-    dataset = _BottleneckFeatureDataset(samples, traces, tokenizer)
-    pad_token_id = resolve_pad_token_id(tokenizer)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=True,
-        num_workers=0,
-        collate_fn=lambda features: collate_bottleneck_features(features, pad_token_id),
-    )
-
-
-def _build_distillation_train_loader(
-    samples: list[SupervisedSample],
-    traces: list[TraceSample],
-    tokenizer,
-    batch_size: int,
-):
-    try:
-        from torch.utils.data import DataLoader
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError("torch is required to construct dataloaders") from exc
-
-    dataset = _DistillationFeatureDataset(samples, traces, tokenizer)
-    pad_token_id = resolve_pad_token_id(tokenizer)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=True,
-        num_workers=0,
-        collate_fn=lambda features: collate_distillation_features(features, pad_token_id),
-    )
-
-
-def _collect_trace_inputs(sample_loader) -> list[SupervisedSample]:
-    samples: list[SupervisedSample] = []
-    for batch in sample_loader:
-        samples.extend(batch)
-    return samples
-
-
-def _build_bottleneck_traces(
+def _build_bottleneck_batch_traces(
     samples: list[SupervisedSample],
     *,
     model,
@@ -384,22 +469,19 @@ def _build_bottleneck_traces(
             initialize_random_trace(sample, tokenizer_artifacts.abstract_tokens, rng, round_idx=round_idx)
             for sample in samples
         ]
-    return [
-        generate_on_policy_trace(
-            model,
-            tokenizer,
-            sample,
-            artifacts=tokenizer_artifacts,
-            max_trace_length=runtime.max_trace_length,
-            device=runtime.device,
-            include_cot=True,
-            round_idx=round_idx,
-        )
-        for sample in samples
-    ]
+    return generate_on_policy_traces(
+        model,
+        tokenizer,
+        samples,
+        artifacts=tokenizer_artifacts,
+        max_trace_length=runtime.max_trace_length,
+        device=runtime.device,
+        include_cot=True,
+        round_idx=round_idx,
+    )
 
 
-def _build_distillation_traces(
+def _build_distillation_batch_traces(
     samples: list[SupervisedSample],
     *,
     model,
@@ -408,99 +490,370 @@ def _build_distillation_traces(
     runtime: WarmupRuntimeConfig,
     round_idx: int,
 ) -> list[TraceSample]:
-    return [
-        generate_on_policy_trace(
-            model,
-            tokenizer,
-            sample,
-            artifacts=tokenizer_artifacts,
-            max_trace_length=runtime.max_trace_length,
-            device=runtime.device,
-            include_cot=False,
-            round_idx=round_idx,
-        )
-        for sample in samples
+    return generate_on_policy_traces(
+        model,
+        tokenizer,
+        samples,
+        artifacts=tokenizer_artifacts,
+        max_trace_length=runtime.max_trace_length,
+        device=runtime.device,
+        include_cot=False,
+        round_idx=round_idx,
+    )
+
+
+def _collate_phase_features(features, pad_token_id: int) -> dict[str, Any]:
+    return collate_distillation_features(features, pad_token_id)
+
+
+def _count_supervised_tokens(batch: dict[str, Any]) -> int:
+    return sum(
+        1
+        for labels in batch["labels"]
+        for label in labels[1:]
+        if label != -100
+    )
+
+
+def _build_bottleneck_step_batches(
+    samples: list[SupervisedSample],
+    traces: list[TraceSample],
+    tokenizer,
+    pad_token_id: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    z_features = []
+    y_features = []
+    for sample, trace in zip(samples, traces, strict=True):
+        example = build_bottleneck_sft_example(sample, trace)
+        z_features.append(build_bottleneck_z_feature(example, tokenizer))
+        y_features.append(build_bottleneck_y_feature(example, tokenizer))
+    return (
+        _collate_phase_features(z_features, pad_token_id),
+        _collate_phase_features(y_features, pad_token_id),
+    )
+
+
+def _build_distillation_step_batch(
+    samples: list[SupervisedSample],
+    traces: list[TraceSample],
+    tokenizer,
+    pad_token_id: int,
+) -> dict[str, Any]:
+    features = [
+        build_distillation_feature(build_distillation_example(sample, trace), tokenizer)
+        for sample, trace in zip(samples, traces, strict=True)
     ]
+    return _collate_phase_features(features, pad_token_id)
 
 
-def run_sft_phase(
+def run_online_bottleneck_phase(
     trainer,
     optimizer,
-    dataloader,
+    sample_loader,
     *,
+    model,
+    tokenizer,
+    tokenizer_artifacts: TokenizerArtifacts,
+    runtime: WarmupRuntimeConfig,
     distributed: DistributedContext,
+    round_idx: int,
     phase_name: str,
+    writer=None,
+    global_step: int = 0,
+    max_steps: int | None = None,
+    memory_snapshot: MemorySnapshotRecorder | None = None,
+):
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("torch is required for bottleneck training") from exc
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:  # pragma: no cover - optional dependency
+        tqdm = None
+
+    pad_token_id = resolve_pad_token_id(tokenizer)
+    losses: list[float] = []
+    iterable = sample_loader
+    if tqdm is not None and distributed.is_main_process:
+        iterable = tqdm(sample_loader, desc=phase_name, leave=False)
+    step = 0
+    phase_completed = False
+    if memory_snapshot is not None:
+        memory_snapshot.start(phase_name)
+    _log_cuda_mem("phase_start", device=distributed.device, phase_name=phase_name, step=step)
+    try:
+        for sample_batch in iterable:
+            optimizer.zero_grad()
+            try:
+                _log_cuda_mem(
+                    "before_trace_generation",
+                    device=distributed.device,
+                    phase_name=phase_name,
+                    step=step,
+                    batch_size=len(sample_batch),
+                    prompt_chars=[len(sample.prompt) for sample in sample_batch],
+                    cot_chars=[len(sample.cot or "") for sample in sample_batch],
+                    answer_chars=[len(sample.answer) for sample in sample_batch],
+                )
+                traces = _build_bottleneck_batch_traces(
+                    sample_batch,
+                    model=model,
+                    tokenizer=tokenizer,
+                    tokenizer_artifacts=tokenizer_artifacts,
+                    runtime=runtime,
+                    round_idx=round_idx,
+                )
+                _log_cuda_mem(
+                    "after_trace_generation",
+                    device=distributed.device,
+                    phase_name=phase_name,
+                    step=step,
+                    trace_token_lengths=[len(trace.abstract_trace_ids) for trace in traces],
+                    trace_text_chars=[len(trace.abstract_trace_text) for trace in traces],
+                )
+                z_batch, y_batch = _build_bottleneck_step_batches(sample_batch, traces, tokenizer, pad_token_id)
+                _log_cuda_mem(
+                    "after_build_step_batches",
+                    device=distributed.device,
+                    phase_name=phase_name,
+                    step=step,
+                    z_seq_lens=[sum(row) for row in z_batch["attention_mask"]],
+                    y_seq_lens=[sum(row) for row in y_batch["attention_mask"]],
+                )
+                z_tokens = _count_supervised_tokens(z_batch)
+                y_tokens = _count_supervised_tokens(y_batch)
+                total_tokens = z_tokens + y_tokens
+                if total_tokens <= 0:
+                    raise ValueError("bottleneck phase produced no supervised tokens")
+
+                z_result = trainer.training_step(z_batch)
+                _log_cuda_mem(
+                    "after_z_forward_and_loss",
+                    device=distributed.device,
+                    phase_name=phase_name,
+                    step=step,
+                    z_supervised_tokens=z_tokens,
+                )
+                y_result = trainer.training_step(y_batch)
+                _log_cuda_mem(
+                    "after_y_forward_and_loss",
+                    device=distributed.device,
+                    phase_name=phase_name,
+                    step=step,
+                    y_supervised_tokens=y_tokens,
+                )
+                combined_loss = (
+                    (z_result.loss * z_tokens) + (y_result.loss * y_tokens)
+                ) / total_tokens
+                _log_cuda_mem(
+                    "after_combined_loss",
+                    device=distributed.device,
+                    phase_name=phase_name,
+                    step=step,
+                    total_supervised_tokens=total_tokens,
+                )
+                if hasattr(combined_loss, "backward"):
+                    _log_cuda_mem("before_backward", device=distributed.device, phase_name=phase_name, step=step)
+                    combined_loss.backward()
+                    del z_result
+                    del y_result
+                    _log_cuda_mem("after_backward", device=distributed.device, phase_name=phase_name, step=step)
+                    optimizer.step()
+                    _log_cuda_mem("after_optimizer_step", device=distributed.device, phase_name=phase_name, step=step)
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    print(
+                        {
+                            "stage": "oom",
+                            "phase": phase_name,
+                            "device": distributed.device,
+                            "batch_size": len(sample_batch),
+                            "sample_prompt_chars": [len(sample.prompt) for sample in sample_batch],
+                            "sample_cot_chars": [len(sample.cot or "") for sample in sample_batch],
+                            "sample_answer_chars": [len(sample.answer) for sample in sample_batch],
+                            "cuda_mem": _cuda_memory_snapshot(distributed.device),
+                        }
+                    )
+                    if memory_snapshot is not None:
+                        memory_snapshot.dump(phase_name, tag=f"oom-step{step}")
+                raise
+
+            loss_val = _loss_scalar(combined_loss)
+            losses.append(loss_val)
+            if writer is not None and distributed.is_main_process:
+                writer.add_scalar(f"loss/{phase_name}", loss_val, global_step + step)
+            step += 1
+            _log_cuda_mem(
+                "end_of_step",
+                device=distributed.device,
+                phase_name=phase_name,
+                step=step,
+                loss=loss_val,
+            )
+            if tqdm is not None and distributed.is_main_process and hasattr(iterable, "set_postfix"):
+                iterable.set_postfix(loss=f"{losses[-1]:.4f}")
+            if max_steps is not None and step >= max_steps:
+                break
+        phase_completed = True
+    finally:
+        if memory_snapshot is not None and not phase_completed:
+            memory_snapshot.stop(phase_name)
+
+    local_steps = len(losses)
+    local_loss_sum = sum(losses)
+    total_steps = int(reduce_scalar_sum(float(local_steps), distributed.device))
+    total_loss_sum = reduce_scalar_sum(local_loss_sum, distributed.device)
+    if writer is not None and distributed.is_main_process and losses:
+        writer.add_scalar(f"loss/{phase_name}_mean", local_loss_sum / max(local_steps, 1), global_step)
+        writer.flush()
+    if memory_snapshot is not None:
+        memory_snapshot.dump(phase_name, tag=f"steps{step}")
+        memory_snapshot.stop(phase_name)
+    _log_cuda_mem("phase_end", device=distributed.device, phase_name=phase_name, step=step)
+    return {
+        "per_rank_num_steps": local_steps,
+        "global_num_steps": total_steps,
+        "mean_loss": total_loss_sum / max(total_steps, 1),
+        "last_loss": losses[-1] if losses else None,
+    }, step
+
+
+def run_online_distillation_phase(
+    trainer,
+    optimizer,
+    sample_loader,
+    *,
+    model,
+    tokenizer,
+    tokenizer_artifacts: TokenizerArtifacts,
+    runtime: WarmupRuntimeConfig,
+    distributed: DistributedContext,
+    round_idx: int,
+    phase_name: str,
+    writer=None,
+    global_step: int = 0,
+    max_steps: int | None = None,
+    memory_snapshot: MemorySnapshotRecorder | None = None,
 ):
     try:
         from tqdm.auto import tqdm
     except ImportError:  # pragma: no cover - optional dependency
         tqdm = None
 
+    pad_token_id = resolve_pad_token_id(tokenizer)
     losses: list[float] = []
-    iterable = dataloader
+    iterable = sample_loader
     if tqdm is not None and distributed.is_main_process:
-        iterable = tqdm(dataloader, desc=phase_name, leave=False)
-    for batch in iterable:
-        optimizer.zero_grad()
-        try:
-            result = trainer.training_step(batch)
-            loss = result.loss
-            if hasattr(loss, "backward"):
-                if _debug_cuda_enabled():
-                    print(
-                        {
-                            "stage": "before_backward",
-                            "phase": phase_name,
-                            "cuda_mem": _cuda_memory_snapshot(distributed.device),
-                        }
-                    )
-                loss.backward()
-                if _debug_cuda_enabled():
-                    print(
-                        {
-                            "stage": "after_backward",
-                            "phase": phase_name,
-                            "cuda_mem": _cuda_memory_snapshot(distributed.device),
-                        }
-                    )
-                optimizer.step()
-                if _debug_cuda_enabled():
-                    print(
-                        {
-                            "stage": "after_optimizer_step",
-                            "phase": phase_name,
-                            "cuda_mem": _cuda_memory_snapshot(distributed.device),
-                        }
-                    )
-        except RuntimeError as exc:
-            if "out of memory" in str(exc).lower():
-                print(
-                    {
-                        "stage": "oom",
-                        "phase": phase_name,
-                        "device": distributed.device,
-                        "batch_input_ids_shape": _tensor_shape(batch.get("input_ids")),
-                        "batch_attention_mask_shape": _tensor_shape(batch.get("attention_mask")),
-                        "batch_segment_ids_shape": _tensor_shape(batch.get("segment_ids")),
-                        "batch_max_seq_len": max((len(row) for row in batch.get("input_ids", [])), default=0),
-                        "cuda_mem": _cuda_memory_snapshot(distributed.device),
-                    }
+        iterable = tqdm(sample_loader, desc=phase_name, leave=False)
+    step = 0
+    phase_completed = False
+    if memory_snapshot is not None:
+        memory_snapshot.start(phase_name)
+    _log_cuda_mem("phase_start", device=distributed.device, phase_name=phase_name, step=step)
+    try:
+        for sample_batch in iterable:
+            optimizer.zero_grad()
+            try:
+                _log_cuda_mem(
+                    "before_trace_generation",
+                    device=distributed.device,
+                    phase_name=phase_name,
+                    step=step,
+                    batch_size=len(sample_batch),
+                    prompt_chars=[len(sample.prompt) for sample in sample_batch],
+                    answer_chars=[len(sample.answer) for sample in sample_batch],
                 )
-            raise
-        losses.append(_loss_scalar(loss))
-        if tqdm is not None and distributed.is_main_process and hasattr(iterable, "set_postfix"):
-            iterable.set_postfix(loss=f"{losses[-1]:.4f}")
+                traces = _build_distillation_batch_traces(
+                    sample_batch,
+                    model=model,
+                    tokenizer=tokenizer,
+                    tokenizer_artifacts=tokenizer_artifacts,
+                    runtime=runtime,
+                    round_idx=round_idx,
+                )
+                _log_cuda_mem(
+                    "after_trace_generation",
+                    device=distributed.device,
+                    phase_name=phase_name,
+                    step=step,
+                    trace_token_lengths=[len(trace.abstract_trace_ids) for trace in traces],
+                    trace_text_chars=[len(trace.abstract_trace_text) for trace in traces],
+                )
+                train_batch = _build_distillation_step_batch(sample_batch, traces, tokenizer, pad_token_id)
+                _log_cuda_mem(
+                    "after_build_step_batch",
+                    device=distributed.device,
+                    phase_name=phase_name,
+                    step=step,
+                    seq_lens=[sum(row) for row in train_batch["attention_mask"]],
+                    supervised_tokens=_count_supervised_tokens(train_batch),
+                )
+                result = trainer.training_step(train_batch)
+                loss = result.loss
+                _log_cuda_mem("after_forward_and_loss", device=distributed.device, phase_name=phase_name, step=step)
+                if hasattr(loss, "backward"):
+                    _log_cuda_mem("before_backward", device=distributed.device, phase_name=phase_name, step=step)
+                    loss.backward()
+                    del result
+                    _log_cuda_mem("after_backward", device=distributed.device, phase_name=phase_name, step=step)
+                    optimizer.step()
+                    _log_cuda_mem("after_optimizer_step", device=distributed.device, phase_name=phase_name, step=step)
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    print(
+                        {
+                            "stage": "oom",
+                            "phase": phase_name,
+                            "device": distributed.device,
+                            "batch_size": len(sample_batch),
+                            "sample_prompt_chars": [len(sample.prompt) for sample in sample_batch],
+                            "sample_answer_chars": [len(sample.answer) for sample in sample_batch],
+                            "cuda_mem": _cuda_memory_snapshot(distributed.device),
+                        }
+                    )
+                    if memory_snapshot is not None:
+                        memory_snapshot.dump(phase_name, tag=f"oom-step{step}")
+                raise
+
+            loss_val = _loss_scalar(loss)
+            losses.append(loss_val)
+            if writer is not None and distributed.is_main_process:
+                writer.add_scalar(f"loss/{phase_name}", loss_val, global_step + step)
+            step += 1
+            _log_cuda_mem(
+                "end_of_step",
+                device=distributed.device,
+                phase_name=phase_name,
+                step=step,
+                loss=loss_val,
+            )
+            if tqdm is not None and distributed.is_main_process and hasattr(iterable, "set_postfix"):
+                iterable.set_postfix(loss=f"{losses[-1]:.4f}")
+            if max_steps is not None and step >= max_steps:
+                break
+        phase_completed = True
+    finally:
+        if memory_snapshot is not None and not phase_completed:
+            memory_snapshot.stop(phase_name)
 
     local_steps = len(losses)
     local_loss_sum = sum(losses)
     total_steps = int(reduce_scalar_sum(float(local_steps), distributed.device))
     total_loss_sum = reduce_scalar_sum(local_loss_sum, distributed.device)
+    if writer is not None and distributed.is_main_process and losses:
+        writer.add_scalar(f"loss/{phase_name}_mean", local_loss_sum / max(local_steps, 1), global_step)
+        writer.flush()
+    if memory_snapshot is not None:
+        memory_snapshot.dump(phase_name, tag=f"steps{step}")
+        memory_snapshot.stop(phase_name)
+    _log_cuda_mem("phase_end", device=distributed.device, phase_name=phase_name, step=step)
     return {
         "per_rank_num_steps": local_steps,
         "global_num_steps": total_steps,
         "mean_loss": total_loss_sum / max(total_steps, 1),
         "last_loss": losses[-1] if losses else None,
-    }
+    }, step
 
 
 def maybe_wrap_fsdp(model, *, distributed: DistributedContext, use_fsdp: bool):
@@ -513,6 +866,43 @@ def maybe_wrap_fsdp(model, *, distributed: DistributedContext, use_fsdp: bool):
     if not distributed.enabled:
         raise RuntimeError("FSDP requested but distributed process group is not initialized")
     return FSDP(model, device_id=distributed.local_rank if distributed.device.startswith("cuda") else None)
+
+
+def _save_checkpoint(
+    model,
+    optimizer,
+    *,
+    output_dir: str,
+    round_idx: int,
+    phase_name: str,
+    global_step: int,
+    distributed: DistributedContext,
+):
+    if not distributed.is_main_process:
+        return
+    import os
+    try:
+        import torch
+    except ImportError:
+        return
+
+    checkpoint_dir = os.path.join(output_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    filename = f"round{round_idx}-{phase_name}-step{global_step}.pt"
+
+    stateful_model = getattr(model, "module", model)
+    state_dict = stateful_model.state_dict() if hasattr(stateful_model, "state_dict") else None
+    optim_state = optimizer.state_dict() if hasattr(optimizer, "state_dict") else None
+
+    checkpoint = {
+        "round_idx": round_idx,
+        "phase_name": phase_name,
+        "global_step": global_step,
+        "model_state_dict": state_dict,
+        "optimizer_state_dict": optim_state,
+    }
+    torch.save(checkpoint, os.path.join(checkpoint_dir, filename))
+    print({"checkpoint_saved": filename, "round": round_idx, "phase": phase_name, "global_step": global_step})
 
 
 def run_minimal_warmup(
@@ -538,8 +928,26 @@ def run_minimal_warmup(
 
     model = maybe_wrap_fsdp(model, distributed=distributed, use_fsdp=runtime.use_fsdp)
     optimizer = torch.optim.AdamW(model.parameters(), lr=runtime.learning_rate)
-    bottleneck_trainer = BottleneckSFTTrainer(model, as_tensors=True, device=runtime.device)
-    distill_trainer = DistillationSFTTrainer(model, as_tensors=True, device=runtime.device)
+    causal_trainer = DistillationSFTTrainer(model, as_tensors=True, device=runtime.device)
+    memory_snapshot = MemorySnapshotRecorder(
+        enabled=runtime.memory_snapshot_enabled,
+        output_dir=runtime.output_dir,
+        device=runtime.device,
+        rank=distributed.rank,
+        max_entries=runtime.memory_snapshot_max_entries,
+    )
+
+    writer = None
+    tensorboard_dir = os.path.join(runtime.output_dir, "tensorboard")
+    if distributed.is_main_process:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            os.makedirs(tensorboard_dir, exist_ok=True)
+            writer = SummaryWriter(tensorboard_dir)
+        except ImportError:
+            pass
+
+    global_step = 0
 
     local_total_samples = sum(len(d_t1) + len(d_t2) for d_t1, d_t2 in round_datasets)
     summary = {
@@ -559,75 +967,90 @@ def run_minimal_warmup(
 
     for round_idx, (d_t1, d_t2) in enumerate(round_datasets, start=1):
         bottleneck_source_loader = _build_phase_sample_loader(d_t1, runtime.batch_size)
-        bottleneck_samples = _collect_trace_inputs(bottleneck_source_loader)
-        bottleneck_traces = _build_bottleneck_traces(
-            bottleneck_samples,
-            model=model,
-            tokenizer=tokenizer,
-            tokenizer_artifacts=tokenizer_artifacts,
-            runtime=runtime,
-            round_idx=round_idx,
-        )
-        bottleneck_train_loader = _build_bottleneck_train_loader(
-            bottleneck_samples,
-            bottleneck_traces,
-            tokenizer,
-            runtime.batch_size,
-        )
-
         if distributed.is_main_process:
             print(
                 {
                     "round": round_idx,
                     "D_t1_size": len(d_t1),
                     "D_t2_size": len(d_t2),
-                    "per_rank_bottleneck_batches": len(bottleneck_train_loader),
+                    "per_rank_bottleneck_batches": len(bottleneck_source_loader),
                 }
             )
 
+        if runtime.device.startswith("cuda"):
+            torch.cuda.empty_cache()
         model.train()
-        bottleneck_metrics = run_sft_phase(
-            bottleneck_trainer,
+        bottleneck_metrics, bottleneck_steps = run_online_bottleneck_phase(
+            causal_trainer,
             optimizer,
-            bottleneck_train_loader,
-            distributed=distributed,
-            phase_name=f"round{round_idx}-bottleneck",
-        )
-
-        distill_source_loader = _build_phase_sample_loader(d_t2, runtime.batch_size)
-        distill_samples = _collect_trace_inputs(distill_source_loader)
-        distill_traces = _build_distillation_traces(
-            distill_samples,
+            bottleneck_source_loader,
             model=model,
             tokenizer=tokenizer,
             tokenizer_artifacts=tokenizer_artifacts,
             runtime=runtime,
+            distributed=distributed,
             round_idx=round_idx,
+            phase_name=f"round{round_idx}-bottleneck",
+            writer=writer,
+            global_step=global_step,
+            max_steps=runtime.max_steps_per_phase,
+            memory_snapshot=memory_snapshot,
         )
-        distill_train_loader = _build_distillation_train_loader(
-            distill_samples,
-            distill_traces,
-            tokenizer,
-            runtime.batch_size,
+        global_step += bottleneck_steps
+        _save_checkpoint(
+            model,
+            optimizer,
+            output_dir=runtime.output_dir,
+            round_idx=round_idx,
+            phase_name="bottleneck",
+            global_step=global_step,
+            distributed=distributed,
         )
+
+        if runtime.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+        distill_source_loader = _build_phase_sample_loader(d_t2, runtime.batch_size)
 
         if distributed.is_main_process:
             print(
                 {
                     "round": round_idx,
-                    "per_rank_distill_batches": len(distill_train_loader),
+                    "per_rank_distill_batches": len(distill_source_loader),
                 }
             )
 
+        if runtime.device.startswith("cuda"):
+            torch.cuda.empty_cache()
         model.train()
-        distill_metrics = run_sft_phase(
-            distill_trainer,
+        distill_metrics, distill_steps = run_online_distillation_phase(
+            causal_trainer,
             optimizer,
-            distill_train_loader,
+            distill_source_loader,
+            model=model,
+            tokenizer=tokenizer,
+            tokenizer_artifacts=tokenizer_artifacts,
+            runtime=runtime,
             distributed=distributed,
+            round_idx=round_idx,
             phase_name=f"round{round_idx}-distill",
+            writer=writer,
+            global_step=global_step,
+            max_steps=runtime.max_steps_per_phase,
+            memory_snapshot=memory_snapshot,
+        )
+        global_step += distill_steps
+        _save_checkpoint(
+            model,
+            optimizer,
+            output_dir=runtime.output_dir,
+            round_idx=round_idx,
+            phase_name="distill",
+            global_step=global_step,
+            distributed=distributed,
         )
 
+        if runtime.device.startswith("cuda"):
+            torch.cuda.empty_cache()
         summary["round_summaries"].append(
             {
                 "round": round_idx,
@@ -645,4 +1068,6 @@ def run_minimal_warmup(
         stateful_model = getattr(model, "module", model)
         if hasattr(stateful_model, "save_pretrained"):
             stateful_model.save_pretrained(runtime.output_dir)
+        if writer is not None:
+            writer.close()
     return summary

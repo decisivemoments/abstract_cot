@@ -4,9 +4,9 @@ import argparse
 import json
 import random
 
-from abstract_cot.data.collator import collate_bottleneck_features
+from abstract_cot.data.collator import collate_distillation_features
 from abstract_cot.data.schema import SupervisedSample
-from abstract_cot.data.tokenized_features import build_bottleneck_feature
+from abstract_cot.data.tokenized_features import build_bottleneck_y_feature, build_bottleneck_z_feature
 from abstract_cot.data.warmup_dataset import build_bottleneck_sft_example, initialize_random_trace
 from abstract_cot.tokenization.abstract_vocab import build_abstract_vocabulary
 
@@ -49,19 +49,26 @@ def main() -> None:
         rng=random.Random(args.seed),
         round_idx=1,
     )
-    feature = build_bottleneck_feature(build_bottleneck_sft_example(sample, trace), tokenizer)
-    batch = collate_bottleneck_features([feature], pad_token_id=tokenizer.pad_token_id)
+    example = build_bottleneck_sft_example(sample, trace)
+    z_batch = collate_distillation_features(
+        [build_bottleneck_z_feature(example, tokenizer)],
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    y_batch = collate_distillation_features(
+        [build_bottleneck_y_feature(example, tokenizer)],
+        pad_token_id=tokenizer.pad_token_id,
+    )
     print(
         json.dumps(
             {
-                "input_ids": batch["input_ids"][0],
-                "labels": batch["labels"][0],
-                "segment_ids": batch["segment_ids"][0],
-                "attention_mask": batch["attention_mask"][0],
-                "bottleneck_attention_mask_shape": [
-                    len(batch["bottleneck_attention_mask"][0]),
-                    len(batch["bottleneck_attention_mask"][0][0]),
-                ],
+                "z_input_ids": z_batch["input_ids"][0],
+                "z_labels": z_batch["labels"][0],
+                "z_segment_ids": z_batch["segment_ids"][0],
+                "z_attention_mask": z_batch["attention_mask"][0],
+                "y_input_ids": y_batch["input_ids"][0],
+                "y_labels": y_batch["labels"][0],
+                "y_segment_ids": y_batch["segment_ids"][0],
+                "y_attention_mask": y_batch["attention_mask"][0],
             },
             indent=2,
         )

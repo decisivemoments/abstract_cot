@@ -81,8 +81,24 @@
 当前状态：
 
 - 规则本身已实现并测试
-- 训练路径里已不再把完整 `L x L` bool mask 存在 feature 中
-- 当前改为根据 `segment_ids + attention_mask` 在前向前构造 additive bottleneck mask
+- 当前训练主路径已不再依赖显式的 4D additive bottleneck mask
+- bottleneck phase 改为两次标准 causal decoder forward 来等价实现约束
+
+当前训练等价改写：
+
+1. `Z` 子阶段输入 `[X; C; Z]`
+   - 只在 `Z` token 上计算 loss
+   - 因果 mask 天然保证 `Z` 只能看 `X + C + previous Z`
+
+2. `Y` 子阶段输入 `[X; Z; Y]`
+   - 只在 `Y` token 上计算 loss
+   - 因果 mask 天然保证 `Y` 只能看 `X + Z + previous Y`
+
+这样做的直接收益：
+
+- 避免构造和传递完整 `B x 1 x L x L` attention bias
+- bottleneck phase 回到标准 decoder attention 形式
+- 可以继续使用 `sdpa` / flash-attention 一类的快速路径，而不是被 4D mask 迫使回退
 
 对应实现：
 
@@ -99,25 +115,29 @@
 初始化 θ^(0)
 
 for t = 1 ... T:
-    从 D_t,1 构造 bottleneck 阶段数据
+    遍历 D_t,1 的每个训练 batch
         if t == 1:
-            使用随机 abstract trace
+            当前 batch 使用随机 abstract trace
         else:
-            用当前模型在 x + c 条件下 constrained decoding 生成 trace
+            当前 batch 先用当前模型在 x + c 条件下 constrained decoding 生成 trace
 
-    用 [x; c; z; y] 做 bottleneck SFT，得到 θ_bar^(t)
+        bottleneck 训练拆成两次 forward:
+            1. 用 [x; c; z]，只在 z 上算 loss
+            2. 用 [x; z; y]，只在 y 上算 loss
 
-    从 D_t,2 构造 distill 阶段数据
-        用 θ_bar^(t) 在 x 条件下生成 prompt-only trace
+    得到 θ_bar^(t)
 
-    用 [x; z'; y] 做 self-distillation，得到 θ^(t)
+    遍历 D_t,2 的每个训练 batch
+        当前 batch 先用 θ_bar^(t) 在 x 条件下生成 prompt-only trace
+        再用 [x; z'; y] 做 self-distillation，得到 θ^(t)
 ```
 
 当前实现特点：
 
 - `rounds` 是唯一的迭代控制参数
 - `D_t,1` 和 `D_t,2` 从本轮数据中切分得到
-- 每个 phase 使用 `datasets` + `torch.utils.data.DataLoader`
+- 每个 phase 使用 `torch.utils.data.DataLoader` 迭代 `SupervisedSample` batch
+- bottleneck / distill 都改为按 batch 在线生成 trace，不再在 phase 开始前一次性预生成整轮 trace
 - FSDP 路径已经可用
 
 对应实现：

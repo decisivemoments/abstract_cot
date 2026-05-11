@@ -102,6 +102,7 @@ class BaseSFTTrainer:
                 }
             )
         model_outputs = self.model(**prepared.model_inputs)
+        loss = _extract_loss(model_outputs, prepared.model_inputs)
         if _debug_cuda_enabled():
             print(
                 {
@@ -110,7 +111,6 @@ class BaseSFTTrainer:
                     "cuda_mem": _cuda_memory_snapshot(self.device),
                 }
             )
-        loss = _extract_loss(model_outputs, prepared.model_inputs)
         if _debug_cuda_enabled():
             print(
                 {

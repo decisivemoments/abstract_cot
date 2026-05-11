@@ -4,7 +4,13 @@ import argparse
 from pathlib import Path
 
 from abstract_cot.modeling.embedding_resize import resize_model_embeddings
-from abstract_cot.modeling.model_loader import load_causal_lm, load_tokenizer, resolve_torch_dtype
+from abstract_cot.modeling.model_loader import (
+    inspect_attention_backend,
+    load_causal_lm,
+    load_tokenizer,
+    resolve_torch_dtype,
+)
+from abstract_cot.modeling.sparse_lm_wrapper import SparseLogitsCausalLMWrapper
 from abstract_cot.tokenization.abstract_vocab import AbstractTokenSpec, build_abstract_vocabulary
 from abstract_cot.tokenization.tokenizer_extension import extend_tokenizer
 from abstract_cot.training.bottleneck_sft import WarmupRuntimeConfig, run_minimal_warmup
@@ -57,8 +63,23 @@ def main() -> None:
             model_cfg["base_model"],
             trust_remote_code=bool(model_cfg.get("trust_remote_code", False)),
             dtype=resolve_torch_dtype(model_cfg.get("torch_dtype")),
-            attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
+            attn_implementation=model_cfg.get("attn_implementation", "flash_attention_2"),
         )
+        if distributed.is_main_process:
+            attention_backend = inspect_attention_backend(
+                model,
+                requested_attn_implementation=model_cfg.get("attn_implementation", "flash_attention_2"),
+            )
+            print({"attention_backend": attention_backend})
+            if (
+                attention_backend["requested_attn_implementation"] == "flash_attention_2"
+                and attention_backend.get("transformers_flash_attn_2_available") is not True
+            ):
+                print(
+                    {
+                        "warning": "flash_attention_2 was requested but transformers does not report it as available",
+                    }
+                )
         if bool(model_cfg.get("gradient_checkpointing", True)):
             if hasattr(model, "gradient_checkpointing_enable"):
                 model.gradient_checkpointing_enable()
@@ -82,6 +103,9 @@ def main() -> None:
         tokenizer_dir = output_dir / "tokenizer"
         artifacts = extend_tokenizer(tokenizer, token_spec, tokenizer_dir)
         resize_model_embeddings(model, len(tokenizer))
+        model = SparseLogitsCausalLMWrapper(model)
+        if distributed.is_main_process:
+            print({"sparse_logits_wrapper_enabled": True, "wrapper_class": type(model).__name__})
 
         if distributed.device.startswith("cuda"):
             model = model.to(distributed.device)

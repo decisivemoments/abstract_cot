@@ -6,6 +6,7 @@ model:
   tokenizer_path: server_assets/models/Qwen3-0.6B
   trust_remote_code: true
   torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
   gradient_checkpointing: true
 
 abstract:

@@ -576,7 +576,7 @@ def run_online_bottleneck_phase(
     losses: list[float] = []
     iterable = sample_loader
     if tqdm is not None and distributed.is_main_process:
-        iterable = tqdm(sample_loader, desc=phase_name, leave=False)
+        iterable = tqdm(sample_loader, desc=phase_name, leave=True)
     step = 0
     phase_completed = False
     if memory_snapshot is not None:
@@ -635,6 +635,19 @@ def run_online_bottleneck_phase(
                     step=step,
                     z_supervised_tokens=z_tokens,
                 )
+                z_weight = z_tokens / total_tokens
+                z_loss = z_result.loss * z_weight
+                if hasattr(z_loss, "backward"):
+                    _log_cuda_mem(
+                        "before_z_backward",
+                        device=distributed.device,
+                        phase_name=phase_name,
+                        step=step,
+                        z_weight=z_weight,
+                    )
+                    z_loss.backward()
+                    del z_result
+                    _log_cuda_mem("after_z_backward", device=distributed.device, phase_name=phase_name, step=step)
                 y_result = trainer.training_step(y_batch)
                 _log_cuda_mem(
                     "after_y_forward_and_loss",
@@ -643,9 +656,9 @@ def run_online_bottleneck_phase(
                     step=step,
                     y_supervised_tokens=y_tokens,
                 )
-                combined_loss = (
-                    (z_result.loss * z_tokens) + (y_result.loss * y_tokens)
-                ) / total_tokens
+                y_weight = y_tokens / total_tokens
+                y_loss = y_result.loss * y_weight
+                combined_loss = z_loss + y_loss
                 _log_cuda_mem(
                     "after_combined_loss",
                     device=distributed.device,
@@ -653,12 +666,17 @@ def run_online_bottleneck_phase(
                     step=step,
                     total_supervised_tokens=total_tokens,
                 )
-                if hasattr(combined_loss, "backward"):
-                    _log_cuda_mem("before_backward", device=distributed.device, phase_name=phase_name, step=step)
-                    combined_loss.backward()
-                    del z_result
+                if hasattr(y_loss, "backward"):
+                    _log_cuda_mem(
+                        "before_y_backward",
+                        device=distributed.device,
+                        phase_name=phase_name,
+                        step=step,
+                        y_weight=y_weight,
+                    )
+                    y_loss.backward()
                     del y_result
-                    _log_cuda_mem("after_backward", device=distributed.device, phase_name=phase_name, step=step)
+                    _log_cuda_mem("after_y_backward", device=distributed.device, phase_name=phase_name, step=step)
                     optimizer.step()
                     _log_cuda_mem("after_optimizer_step", device=distributed.device, phase_name=phase_name, step=step)
             except RuntimeError as exc:
@@ -745,7 +763,7 @@ def run_online_distillation_phase(
     losses: list[float] = []
     iterable = sample_loader
     if tqdm is not None and distributed.is_main_process:
-        iterable = tqdm(sample_loader, desc=phase_name, leave=False)
+        iterable = tqdm(sample_loader, desc=phase_name, leave=True)
     step = 0
     phase_completed = False
     if memory_snapshot is not None:
@@ -903,6 +921,83 @@ def _save_checkpoint(
     }
     torch.save(checkpoint, os.path.join(checkpoint_dir, filename))
     print({"checkpoint_saved": filename, "round": round_idx, "phase": phase_name, "global_step": global_step})
+
+
+def _unwrap_stateful_model(model):
+    stateful_model = getattr(model, "module", model)
+    return getattr(stateful_model, "inner_model", stateful_model)
+
+
+def _gather_full_model_state_dict(model, *, distributed: DistributedContext):
+    if distributed.enabled:
+        try:
+            from torch.distributed.fsdp import (
+                FullStateDictConfig,
+                FullyShardedDataParallel as FSDP,
+                StateDictType,
+            )
+        except ImportError:  # pragma: no cover - optional dependency
+            FSDP = None
+
+        if FSDP is not None and isinstance(model, FSDP):
+            full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            print(
+                {
+                    "save_stage": "before_fsdp_full_state_dict_gather",
+                    "rank": distributed.rank,
+                    "world_size": distributed.world_size,
+                }
+            )
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
+                state_dict = model.state_dict()
+            print(
+                {
+                    "save_stage": "after_fsdp_full_state_dict_gather",
+                    "rank": distributed.rank,
+                    "has_state_dict": bool(state_dict),
+                }
+            )
+            return state_dict if distributed.is_main_process else None
+
+    stateful_model = _unwrap_stateful_model(model)
+    if not hasattr(stateful_model, "state_dict"):
+        return None
+    print({"save_stage": "before_state_dict", "rank": distributed.rank})
+    state_dict = stateful_model.state_dict()
+    print({"save_stage": "after_state_dict", "rank": distributed.rank, "has_state_dict": bool(state_dict)})
+    return state_dict
+
+
+def _save_pretrained_model(model, output_dir: str, *, distributed: DistributedContext) -> None:
+    base_model = _unwrap_stateful_model(model)
+    if not hasattr(base_model, "config"):
+        return
+    state_dict = _gather_full_model_state_dict(model, distributed=distributed)
+    if not distributed.is_main_process:
+        return
+    print({"save_stage": "before_save_pretrained", "rank": distributed.rank, "output_dir": output_dir})
+    if state_dict is None:
+        if hasattr(base_model, "save_pretrained"):
+            base_model.save_pretrained(output_dir)
+        print({"save_stage": "after_save_pretrained", "rank": distributed.rank, "output_dir": output_dir})
+        return
+
+    from safetensors.torch import save_file
+    from transformers.utils import SAFE_WEIGHTS_NAME
+
+    os.makedirs(output_dir, exist_ok=True)
+    tensor_state_dict = {
+        key: value.detach().cpu().contiguous()
+        for key, value in state_dict.items()
+        if hasattr(value, "detach")
+    }
+    weights_path = os.path.join(output_dir, SAFE_WEIGHTS_NAME)
+    save_file(tensor_state_dict, weights_path, metadata={"format": "pt"})
+    base_model.config.save_pretrained(output_dir)
+    generation_config = getattr(base_model, "generation_config", None)
+    if generation_config is not None and hasattr(generation_config, "save_pretrained"):
+        generation_config.save_pretrained(output_dir)
+    print({"save_stage": "after_save_pretrained", "rank": distributed.rank, "output_dir": output_dir})
 
 
 def run_minimal_warmup(
@@ -1064,10 +1159,10 @@ def run_minimal_warmup(
     if distributed.is_main_process:
         write_json(f"{runtime.output_dir}/warmup_summary.json", summary)
         if hasattr(tokenizer, "save_pretrained"):
+            print({"save_stage": "before_tokenizer_save", "rank": distributed.rank, "output_dir": runtime.output_dir})
             tokenizer.save_pretrained(runtime.output_dir)
-        stateful_model = getattr(model, "module", model)
-        if hasattr(stateful_model, "save_pretrained"):
-            stateful_model.save_pretrained(runtime.output_dir)
-        if writer is not None:
-            writer.close()
+            print({"save_stage": "after_tokenizer_save", "rank": distributed.rank, "output_dir": runtime.output_dir})
+    _save_pretrained_model(model, runtime.output_dir, distributed=distributed)
+    if distributed.is_main_process and writer is not None:
+        writer.close()
     return summary

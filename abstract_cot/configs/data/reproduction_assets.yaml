@@ -7,6 +7,18 @@ datasets:
     repo_type: dataset
     repo_id: allenai/Dolci-Think-RL-7B
     local_subdir: datasets/Dolci-Think-RL-7B
+  gsm8k:
+    repo_type: dataset
+    repo_id: openai/gsm8k
+    local_subdir: datasets/gsm8k
+  math_500:
+    repo_type: dataset
+    repo_id: HuggingFaceH4/MATH-500
+    local_subdir: datasets/MATH-500
+  aime_2025:
+    repo_type: dataset
+    repo_id: MathArena/aime_2025
+    local_subdir: datasets/aime_2025
 
 models:
   qwen3_0p6b:

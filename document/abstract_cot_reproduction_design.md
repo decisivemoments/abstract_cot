@@ -63,7 +63,14 @@
 - 最大 abstract 长度约束
 - warm-up 中 on-policy trace 生成
 
-当前 on-policy trace 生成已经接入 KV cache，避免每一步重算整段前缀。
+当前 on-policy trace 生成已经进一步改成：
+
+- batch 级 prompt encode
+- tokenizer 左 padding
+- batched autoregressive decode
+- KV cache 增量生成
+
+也就是说，当前 trace 生成不再按 sample 串行逐条 decode，而是整 batch 一起生成。
 
 对应实现：
 
@@ -98,7 +105,7 @@
 
 - 避免构造和传递完整 `B x 1 x L x L` attention bias
 - bottleneck phase 回到标准 decoder attention 形式
-- 可以继续使用 `sdpa` / flash-attention 一类的快速路径，而不是被 4D mask 迫使回退
+- 可以继续使用 flash-attention / SDPA 一类的快速路径，而不是被 4D mask 迫使回退
 
 对应实现：
 
@@ -138,13 +145,38 @@ for t = 1 ... T:
 - `D_t,1` 和 `D_t,2` 从本轮数据中切分得到
 - 每个 phase 使用 `torch.utils.data.DataLoader` 迭代 `SupervisedSample` batch
 - bottleneck / distill 都改为按 batch 在线生成 trace，不再在 phase 开始前一次性预生成整轮 trace
-- FSDP 路径已经可用
+- bottleneck phase 中 `Z` forward 与 `Y` forward 分开 backward，再统一 optimizer step
+- 当前训练默认开启 gradient checkpointing
+- 当前训练路径已支持 FSDP
+
+### 3.5 当前训练侧的显存优化
+
+为了让 warm-up 能在长序列和多卡场景下继续推进，当前已经接入以下训练实现：
+
+1. Flash Attention 2 路径
+   - 模型加载时显式请求 `flash_attention_2`
+   - 启动时会打印后端诊断信息，检查环境是否真的可用
+
+2. Sparse logits wrapper
+   - 训练只在有监督 token 上计算 lm head
+   - 不再为整段前缀 materialize 全量 `B x T x V` logits
+   - 当前通过项目内 wrapper 实现，而不是改底层模型 `forward`
+
+3. CUDA 显存观测
+   - 支持关键阶段显存日志
+   - 支持 PyTorch memory snapshot 采样
+
+4. 最终导出
+   - FSDP 下最终模型通过 full state dict gather 后导出
+   - 最终模型权重保存为 `model.safetensors`
+   - phase checkpoint 仍为 `.pt`
 
 对应实现：
 
-- [bottleneck_sft.py](../abstract_cot/src/abstract_cot/training/bottleneck_sft.py)
+- [model_loader.py](../abstract_cot/src/abstract_cot/modeling/model_loader.py)
+- [sparse_lm_wrapper.py](../abstract_cot/src/abstract_cot/modeling/sparse_lm_wrapper.py)
 - [sft_trainer.py](../abstract_cot/src/abstract_cot/training/sft_trainer.py)
-- [run_warmup_mvp.py](../abstract_cot/scripts/run_warmup_mvp.py)
+- [bottleneck_sft.py](../abstract_cot/src/abstract_cot/training/bottleneck_sft.py)
 
 ---
 
@@ -201,6 +233,7 @@ answer
 
 - 预处理阶段不做训练卡数相关的分发
 - 训练时再根据实际 `world_size` 分配本轮样本
+- 当前 warm-up 预处理已按长度阈值过滤，实际训练使用的是 `8k` 以下样本
 
 对应实现：
 
@@ -254,6 +287,22 @@ answer
 - FSDP 可启动
 - 一轮最小 Stage 1 可以跑通
 - summary 会正确输出 per-rank steps、global steps、loss
+- 训练进度条、phase checkpoint、最终模型导出都已接入
+
+### 6.4 当前已完成的一次可用训练
+
+截至当前，已经按现有 warm-up 配置完成过一次：
+
+- 基座模型：`Qwen3-0.6B`
+- 数据：`Dolci-Think-SFT-7B-cot`
+- 长度过滤：`8k` 以下样本
+
+这说明当前工程链条已经不只是 smoke run，而是能完成一次实际 warm-up 训练。
+
+但这个结果还不能视为论文复现完成。原因很明确：
+
+- `0.6B` 模型规模太小，不能据此判断论文结论是否成立
+- 后续至少需要推进到 `4B` 量级，才能开始验证 warm-up only 的有效性
 
 一个已跑通的最小结果示意：
 
@@ -279,52 +328,46 @@ answer
 
 ## 7. 当前主要问题
 
-### 7.1 大样本训练时仍然不稳定
+### 7.1 复现层面还没有触达目标模型规模
 
-当 `max_samples` 增大后，Stage 1 在第一轮 bottleneck phase 仍可能：
+当前已经证明工程链能跑，但还没有触达论文复现真正关心的模型尺度。
 
-- 卡在第一个 step 前后
-- 某个 rank 被 `SIGKILL`
-- 导致 `torchrun` 终止其他进程
+当前缺口：
 
-当前判断：
+- 只完成过 `0.6B` 级别 warm-up
+- 还没有完成 `4B` 及以上模型训练
 
-- 不是原先那种“每卡样本数不一致”的问题
-- 更可能是数据加载和第一步前向的内存 / CPU 峰值问题
+这意味着当前还不能回答：
 
-### 7.2 `load_from_disk` 仍需进一步优化
+- warm-up only 是否在论文目标尺度上成立
+- abstract reasoning 是否真的需要更大模型容量才会表现出来
 
-虽然当前已经改成：
+### 7.2 数据加载路径仍然偏保守
+
+虽然当前已经采用：
 
 - `rank0 load_from_disk`
-- 再把本轮所需样本 scatter 给其他 rank
+- 再 scatter 本轮样本
 
-但这仍然不是最终高效方案。当前实现属于“先稳住内存，再谈吞吐”的过渡版本。
+但这依然是“先可用、后优化”的方案。
 
-后续可能需要：
+后续可能还需要：
 
-- 更明确的主进程数据服务式加载
-- 更轻的 rank 间样本下发方式
-- 更少的 Python object 传输
+- dataset 流式化或更轻的索引式分发
+- 更少的 Python object scatter
+- 更明确的数据缓存和复用策略
 
-### 7.3 Bottleneck phase 仍然偏重
+### 7.3 当前还没有正式评测框架
 
-虽然 mask 已经不再以 `L x L bool` 常驻 feature，但 bottleneck phase 仍然比 distill phase 重很多。
+目前训练侧已经基本成型，但评测链仍然空缺。
 
-原因：
+当前还没有系统化实现：
 
-- bottleneck attention 仍是自定义 4D additive mask 路径
-- 很难走最优注意力 kernel
-- 序列较长时仍可能产生较大 CPU/GPU 开销
-
-### 7.4 还没有正式评测链
-
-当前只有训练 loss 和 summary，没有：
-
-- benchmark eval
-- warm-up 前后输出对比
-- abstract trace 质量检查脚本
-- truncation / permutation / frequency 分析
+- warmup-only abstract CoT benchmark eval
+- baseline 对比
+- trace 输出与 answer 输出的统一记录
+- metrics 聚合与按数据集汇总
+- 可复现的 eval config / report 产物
 
 ---
 
@@ -354,35 +397,35 @@ answer
 
 当前最合理的优先级：
 
-1. 继续稳定 Stage 1 大样本训练
-2. 解决多卡下数据加载与首步 bottleneck phase 的资源峰值问题
-3. 增加 warm-up 后的最小 inference / eval 脚本
-4. 在 Stage 1 稳定后再进入 Stage 2 RL
+1. 推进 `4B` 及以上模型的 warm-up 训练
+2. 建立 warmup-only 的正式 eval 框架
+3. 先完成 baseline 与 abstract-CoT 的直接对比
+4. 在评测链稳定后，再考虑 Stage 2 RL 和更复杂分析实验
 
 不建议当前就做的事：
 
-- 直接扩大到更大模型规模
-- 提前做复杂分析实验
-- 把连续 latent 分支混入主训练路径
+- 在没有 eval 框架前继续扩展复杂实验矩阵
+- 提前把 RL 分支和主线 warm-up 混在一起
+- 在 `0.6B` 结果上做过多结论性解释
 
 ---
 
 ## 10. 当前结论
 
-当前项目已经从“论文 idea 整理”进入“可运行但仍需稳定化”的阶段。
+当前项目已经从“论文 idea 整理”进入“训练链已跑通、接下来要做规模验证和评测框架”的阶段。
 
 更准确地说：
 
 - Stage 1 主流程已经实现
 - 服务器训练链已经打通
-- 小规模多卡 smoke run 已通过
-- 主要风险从“功能缺失”转移到了“规模化训练时的数据与内存效率”
+- `0.6B + 8k以下数据` 已完成一次可用 warm-up 训练
+- 当前主要缺口从“能不能训”转为“更大模型是否有效，以及如何系统评测”
 
 因此，下一个对话最适合继续围绕：
 
-- Stage 1 大样本稳定性
-- 数据加载优化
-- bottleneck phase 的性能与内存问题
-- 最小评测链
+- `4B` 量级 warm-up 训练
+- warmup-only 的 baseline eval 框架
+- benchmark 选择、数据适配与指标定义
+- inference / report / trace dump 的统一接口
 
 而不是再回到最早期的系统设计阶段。

@@ -1,0 +1,50 @@
+experiment_id: warmup_only_eval
+seed: 42
+
+abstract:
+  max_trace_length: 128
+
+eval:
+  model_runs:
+    - run_name: qwen3_4b_baseline
+      model_path: server_assets/models/Qwen3-4B
+      tokenizer_path: server_assets/models/Qwen3-4B
+      trust_remote_code: true
+      torch_dtype: bfloat16
+      attn_implementation: flash_attention_2
+      modes:
+        - direct-answer
+        - natural-cot
+    - run_name: qwen3_4b_warmup
+      model_path: outputs/experiments/qwen3_4b_warmup
+      tokenizer_path: outputs/experiments/qwen3_4b_warmup
+      tokenizer_artifacts_path: outputs/experiments/qwen3_4b_warmup/tokenizer/abstract_tokenizer_artifacts.json
+      trust_remote_code: true
+      torch_dtype: bfloat16
+      attn_implementation: flash_attention_2
+      modes:
+        - abstract-cot
+
+  benchmarks:
+    - dataset_name: gsm8k
+      dataset_path: server_assets/datasets/gsm8k
+      subset: main
+      split: test
+      max_samples: 200
+      batch_size: 8
+      max_answer_new_tokens: 256
+    - dataset_name: math-500
+      dataset_path: server_assets/datasets/MATH-500
+      split: test
+      max_samples: 200
+      batch_size: 4
+      max_answer_new_tokens: 512
+    - dataset_name: aime
+      dataset_path: server_assets/datasets/aime_2025
+      split: train
+      max_samples: null
+      batch_size: 4
+      max_answer_new_tokens: 512
+
+output:
+  root_dir: outputs/evals

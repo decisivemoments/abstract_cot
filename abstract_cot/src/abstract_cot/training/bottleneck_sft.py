@@ -928,6 +928,18 @@ def _unwrap_stateful_model(model):
     return getattr(stateful_model, "inner_model", stateful_model)
 
 
+def _normalize_export_state_dict_keys(state_dict: dict[str, Any] | None) -> dict[str, Any] | None:
+    if state_dict is None:
+        return None
+    normalized: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        normalized_key = key
+        if normalized_key.startswith("inner_model."):
+            normalized_key = normalized_key[len("inner_model.") :]
+        normalized[normalized_key] = value
+    return normalized
+
+
 def _gather_full_model_state_dict(model, *, distributed: DistributedContext):
     if distributed.enabled:
         try:
@@ -957,7 +969,7 @@ def _gather_full_model_state_dict(model, *, distributed: DistributedContext):
                     "has_state_dict": bool(state_dict),
                 }
             )
-            return state_dict if distributed.is_main_process else None
+            return _normalize_export_state_dict_keys(state_dict) if distributed.is_main_process else None
 
     stateful_model = _unwrap_stateful_model(model)
     if not hasattr(stateful_model, "state_dict"):
@@ -965,7 +977,7 @@ def _gather_full_model_state_dict(model, *, distributed: DistributedContext):
     print({"save_stage": "before_state_dict", "rank": distributed.rank})
     state_dict = stateful_model.state_dict()
     print({"save_stage": "after_state_dict", "rank": distributed.rank, "has_state_dict": bool(state_dict)})
-    return state_dict
+    return _normalize_export_state_dict_keys(state_dict)
 
 
 def _save_pretrained_model(model, output_dir: str, *, distributed: DistributedContext) -> None:

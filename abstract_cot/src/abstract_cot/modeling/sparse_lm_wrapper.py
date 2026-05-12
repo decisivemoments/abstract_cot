@@ -19,13 +19,29 @@ class SparseLogitsCausalLMWrapper(nn.Module):
         super().__init__()
         self.inner_model = model
 
+    def _base_model(self):
+        base_model_prefix = getattr(self.inner_model, "base_model_prefix", None)
+        if isinstance(base_model_prefix, str) and base_model_prefix:
+            base_model = getattr(self.inner_model, base_model_prefix, None)
+            if base_model is not None:
+                return base_model
+
+        for attr_name in ("model", "transformer"):
+            base_model = getattr(self.inner_model, attr_name, None)
+            if base_model is not None:
+                return base_model
+
+        raise AttributeError(
+            f"{type(self.inner_model).__name__} does not expose a recognized base model module"
+        )
+
     @property
     def config(self):
         return self.inner_model.config
 
     @property
     def model(self):
-        return self.inner_model.model
+        return self._base_model()
 
     @property
     def lm_head(self):
@@ -47,7 +63,7 @@ class SparseLogitsCausalLMWrapper(nn.Module):
         if labels is None:
             return self.inner_model(labels=labels, **kwargs)
 
-        base_outputs = self.inner_model.model(**kwargs)
+        base_outputs = self._base_model()(**kwargs)
         hidden_states = base_outputs.last_hidden_state
         shift_hidden_states = hidden_states[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
